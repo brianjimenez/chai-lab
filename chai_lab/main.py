@@ -10,6 +10,7 @@ import typer
 
 from chai_lab.chai1 import run_inference
 from chai_lab.data.parsing.msas.aligned_pqt import merge_a3m_in_directory
+from chai_lab.confidence import score
 
 logging.basicConfig(level=logging.INFO)
 
@@ -36,11 +37,12 @@ def citation():
 def cli():
     app = typer.Typer()
     app.command("fold", help="Run Chai-1 to fold a complex.")(run_inference)
+    app.command("score", help="Run Chai-1 confidence header to score a list of PDB structures.")(score)
     app.command(
         "a3m-to-pqt",
-        help="Convert all a3m files in a directory for a *single sequence* into a aligned parquet file",
+        help="Convert all a3m files in a directory for a *single sequence* into a aligned parquet file.",
     )(merge_a3m_in_directory)
-    app.command("citation", help="Print citation information")(citation)
+    app.command("citation", help="Print citation information.")(citation)
     app()
 
 
