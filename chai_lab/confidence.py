@@ -4,14 +4,40 @@ import numpy as np
 import tempfile
 from pathlib import Path
 from Bio.PDB import PDBParser
+from Bio.PDB.Residue import Residue
 
 # Import chai_lab core modules
 try:
-    import chai_lab.chai1
-    from chai_lab.chai1 import run_inference
+    from chai_lab.chai1 import make_all_atom_feature_context, run_folding_on_context
+    from chai_lab.data.dataset.structure.all_atom_structure_context import AllAtomStructureContext
     from chai_lab.data.parsing.msas.aligned_pqt import expected_basename
+    from chai_lab.ranking.rank import get_scores
 except ImportError:
     raise ImportError("chai_lab is not installed. Please install it via: pip install -e .")
+
+# Standard amino acid mapping to avoid Biopython versioning issues
+THREE_TO_ONE = {
+    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E',
+    'PHE': 'F', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
+    'LYS': 'K', 'LEU': 'L', 'MET': 'M', 'ASN': 'N',
+    'PRO': 'P', 'GLN': 'Q', 'ARG': 'R', 'SER': 'S',
+    'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
+}
+
+
+def _superimpose(mobile: np.ndarray, target: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """
+    Finds the rigid transform (Kabsch) that best superimposes mobile onto target
+    and applies it to points.
+    """
+    mobile_center = mobile.mean(axis=0)
+    target_center = target.mean(axis=0)
+    h = (mobile - mobile_center).T @ (target - target_center)
+    u, _, vt = np.linalg.svd(h)
+    d = np.sign(np.linalg.det(vt.T @ u.T))
+    rotation = vt.T @ np.diag([1.0, 1.0, d]) @ u.T
+    return (points - mobile_center) @ rotation.T + target_center
+
 
 class ChaiConfidenceScorer:
     def __init__(
@@ -23,8 +49,6 @@ class ChaiConfidenceScorer:
         if msa_directory is not None and not Path(msa_directory).is_dir():
             raise NotADirectoryError(f"MSA directory not found: {msa_directory}")
         self.msa_directory = Path(msa_directory) if msa_directory is not None else None
-        # Save the original loader so we can restore it later
-        self.original_load_exported = chai_lab.chai1.load_exported
 
     def _check_msa_coverage(self, fasta_content: str) -> tuple[int, int]:
         """
@@ -44,176 +68,138 @@ class ChaiConfidenceScorer:
                       "This chain will be scored in single-sequence mode.")
         return found, len(lines) // 2
 
-    def _extract_fasta_and_coords(self, pdb_path: str):
+    def _extract_chains(self, pdb_path: str) -> list[tuple[str, list[Residue]]]:
         """
-        Parses the PDB to extract the amino acid sequence (FASTA) 
-        and the Carbon-Alpha (CA) coordinates.
+        Parses the PDB and returns, for each protein chain of the first model,
+        its id and its standard amino acid residues.
         """
         parser = PDBParser(QUIET=True)
         structure = parser.get_structure("input", pdb_path)
-        
-        # Standard amino acid mapping to avoid Biopython versioning issues
-        three_to_one = {
-            'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E',
-            'PHE': 'F', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
-            'LYS': 'K', 'LEU': 'L', 'MET': 'M', 'ASN': 'N',
-            'PRO': 'P', 'GLN': 'Q', 'ARG': 'R', 'SER': 'S',
-            'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
-        }
-        
-        fasta_str = ""
-        ca_coords = []
-        
-        for model in structure:
-            for chain in model:
-                chain_seq = ""
-                for residue in chain:
-                    res_name = residue.get_resname().upper()
-                    
-                    # Check if it's a standard amino acid
-                    if res_name in three_to_one:
-                        chain_seq += three_to_one[res_name]
-                        
-                        # Extract CA coordinate (fallback to 0 if missing)
-                        if 'CA' in residue:
-                            ca_coords.append(residue['CA'].get_coord())
-                        else:
-                            ca_coords.append([0.0, 0.0, 0.0])
-                            
-                if chain_seq:
-                    fasta_str += f">protein|name=chain_{chain.id}\n{chain_seq}\n"
-            break # Only process the first model in the PDB
-            
-        return fasta_str, np.array(ca_coords)
+        model = next(iter(structure))  # Only process the first model in the PDB
 
-    def score_pdb(self, pdb_file_path: str) -> float:
+        chains = []
+        for chain in model:
+            residues = [r for r in chain if r.get_resname().upper() in THREE_TO_ONE]
+            if residues:
+                chains.append((chain.id, residues))
+        return chains
+
+    @staticmethod
+    def _to_fasta(chains: list[tuple[str, list[Residue]]]) -> str:
+        fasta_str = ""
+        for chain_id, residues in chains:
+            chain_seq = "".join(THREE_TO_ONE[r.get_resname().upper()] for r in residues)
+            fasta_str += f">protein|name=chain_{chain_id}\n{chain_seq}\n"
+        return fasta_str
+
+    @staticmethod
+    def _map_atom_coords(
+        structure_context: AllAtomStructureContext,
+        chains: list[tuple[str, list[Residue]]],
+    ) -> tuple[torch.Tensor, int]:
         """
-        Runs the sequence through the Chai trunk and injects the PDB 
-        coordinates into the confidence head to calculate the different scores.
+        Places the PDB atoms into Chai's atom layout, matching them by chain,
+        residue position and atom name. Heavy atoms missing in the PDB are rebuilt
+        by superimposing the residue's reference conformer onto the atoms present.
+        Returns the coordinates (one row per Chai atom) and the number of rebuilt atoms.
+        """
+        atom_token_index = structure_context.atom_token_index
+        atom_chain_index = (structure_context.token_asym_id[atom_token_index] - 1).tolist()
+        atom_residue_index = structure_context.token_residue_index[atom_token_index].tolist()
+        atom_names = structure_context.atom_ref_name
+
+        num_atoms = structure_context.num_atoms
+        coords = np.zeros((num_atoms, 3), dtype=np.float32)
+        found = np.zeros(num_atoms, dtype=bool)
+        for i in range(num_atoms):
+            _, residues = chains[atom_chain_index[i]]
+            residue = residues[atom_residue_index[i]]
+            if atom_names[i] in residue:
+                coords[i] = residue[atom_names[i]].get_coord()
+                found[i] = True
+
+        ref_pos = structure_context.atom_ref_pos.numpy()
+        atom_token_index = atom_token_index.numpy()
+        for token in np.unique(atom_token_index[~found]):
+            token_atoms = atom_token_index == token
+            present = token_atoms & found
+            missing = token_atoms & ~found
+            if present.sum() < 3:
+                chain_id, residues = chains[atom_chain_index[missing.argmax()]]
+                residue = residues[atom_residue_index[missing.argmax()]]
+                raise ValueError(
+                    f"Chain {chain_id} residue {residue.get_resname()}{residue.id[1]} has "
+                    f"only {present.sum()} heavy atoms; at least 3 are needed to rebuild the missing ones."
+                )
+            coords[missing] = _superimpose(ref_pos[present], coords[present], ref_pos[missing])
+
+        return torch.from_numpy(coords), int((~found).sum())
+
+    def score_pdb(self, pdb_file_path: str) -> dict:
+        """
+        Runs the sequence through the Chai trunk and scores the PDB coordinates
+        with the confidence head to calculate the different scores.
         """
         path = Path(pdb_file_path)
         if not path.is_file():
             raise FileNotFoundError(f"PDB file not found: {pdb_file_path}")
 
         print(f"Parsing {path.name}...")
-        fasta_content, pdb_coords = self._extract_fasta_and_coords(pdb_file_path)
-        
-        if len(pdb_coords) == 0:
-            raise ValueError("No valid amino acid CA coordinates found in PDB.")
+        chains = self._extract_chains(pdb_file_path)
+        if not chains:
+            raise ValueError("No standard amino acid residues found in PDB.")
+        fasta_content = self._to_fasta(chains)
 
         msa_coverage = None
         if self.msa_directory is not None:
             found, total = self._check_msa_coverage(fasta_content)
             msa_coverage = f"{found}/{total}"
 
-        # Proxy class to intercept the confidence head
-        class ConfidenceHeadProxy:
-            def __init__(self, original_module, pdb_coords):
-                self.original_module = original_module
-                self.pdb_coords = pdb_coords
+        device = torch.device(self.device)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
 
-            def __call__(self, *args, **kwargs):
-                print(">> Intercepting confidence head! Injecting custom PDB coordinates...")
-                
-                # Identify where the pred_coords are
-                is_kwarg = 'pred_coords' in kwargs
-                
-                if is_kwarg:
-                    original_coords = kwargs['pred_coords']
-                elif len(args) > 2:
-                    original_coords = args[2]
-                else:
-                    print(">> Warning: Could not locate pred_coords in arguments. Running original.")
-                    return self.original_module(*args, **kwargs)
+            tmp_fasta = base_path / "input.fasta"
+            tmp_fasta.write_text(fasta_content)
 
-                modified_coords = original_coords.clone()
-                
-                # Convert our PDB coords to match the tensor properties
-                pdb_tensor = torch.tensor(
-                    self.pdb_coords, 
-                    dtype=original_coords.dtype, 
-                    device=original_coords.device
-                )
-                
-                L = min(pdb_tensor.shape[0], original_coords.shape[1])
-                
-                if len(original_coords.shape) == 3:
-                    modified_coords[0, :L, :] = pdb_tensor[:L, :]
-                elif len(original_coords.shape) == 4:
-                    modified_coords[0, :L, 1, :] = pdb_tensor[:L, :]
-                    
-                # Package the modified coordinates back into the arguments
-                if is_kwarg:
-                    kwargs['pred_coords'] = modified_coords
-                    new_args = args
-                else:
-                    new_args = list(args)
-                    new_args[2] = modified_coords
-                    
-                # Run the actual model with the injected coordinates
-                # The pipeline will calculate the pTM downstream from these outputs
-                return self.original_module(*new_args, **kwargs)
+            feature_context = make_all_atom_feature_context(
+                fasta_file=tmp_fasta,
+                output_dir=base_path / "features",
+                use_esm_embeddings=True,
+                msa_directory=self.msa_directory,
+                esm_device=device,
+            )
+            parsed_seqs = fasta_content.splitlines()[1::2]
+            chai_seqs = [chain.entity_data.sequence for chain in feature_context.chains]
+            assert chai_seqs == parsed_seqs, f"Sequence mismatch: {chai_seqs} != {parsed_seqs}"
 
-            def __getattr__(self, name):
-                return getattr(self.original_module, name)
+            atom_coords, num_rebuilt = self._map_atom_coords(
+                feature_context.structure_context, chains
+            )
+            if num_rebuilt > 0:
+                print(f">> Warning: rebuilt {num_rebuilt} heavy atoms missing in {path.name}.")
 
-        def patched_load_exported(name, device):
-            module = self.original_load_exported(name, device)
-            
-            # Wrap the confidence head with our proxy
-            if "confidence_head" in name:
-                return ConfidenceHeadProxy(module, pdb_coords)
-                
-            return module
+            print("Running Chai-1 trunk and scoring the PDB coordinates (skipping diffusion)...")
+            candidates = run_folding_on_context(
+                feature_context,
+                output_dir=base_path / "chai_outputs",
+                num_trunk_recycles=1,
+                num_diffn_samples=1,
+                device=device,
+                low_memory=True,
+                atom_coords=atom_coords,
+            )
 
-        # Apply patch and run the inference pipeline
-        chai_lab.chai1.load_exported = patched_load_exported
-        
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                base_path = Path(tmpdir)
-                
-                tmp_fasta = base_path / "input.fasta"
-                tmp_fasta.write_text(fasta_content)
-                
-                chai_output_dir = base_path / "chai_outputs"
-                chai_output_dir.mkdir(exist_ok=True)
-                
-                print("Running Chai-1 trunk to generate embeddings (skipping diffusion)...")
-                
-                run_inference(
-                    fasta_file=tmp_fasta,
-                    output_dir=chai_output_dir, 
-                    num_trunk_recycles=1,       
-                    num_diffn_timesteps=1,
-                    msa_directory=self.msa_directory,
-                    device=self.device
-                )
-                
-                # Dynamically locate the output .npz file
-                npz_files = list(chai_output_dir.glob("*.npz"))
-                
-                if not npz_files:
-                    print(f"Contents of output directory: {list(chai_output_dir.iterdir())}")
-                    raise RuntimeError("ERROR: Inference failed to produce any .npz score files.")
-                
-                # Read the first generated .npz file
-                target_file = npz_files[0]
-                data = np.load(target_file)
-                
-                # Scores: 'aggregate_score', 'ptm', 'iptm', 'per_chain_ptm', 'per_chain_pair_iptm', 'has_inter_chain_clashes', 'chain_chain_clashes'
-                scores = {}
-                for score in data.keys():
-                    scores[score] = float(data[score].flatten()[0])
+        # Scores: 'aggregate_score', 'ptm', 'iptm', 'per_chain_ptm', 'per_chain_pair_iptm', 'has_inter_chain_clashes', 'chain_chain_clashes'
+        scores = {}
+        for score, value in get_scores(candidates.ranking_data[0]).items():
+            scores[score] = float(value.flatten()[0])
 
-                if msa_coverage is not None:
-                    scores['msa_chains'] = msa_coverage
+        scores['rebuilt_atoms'] = num_rebuilt
+        if msa_coverage is not None:
+            scores['msa_chains'] = msa_coverage
 
-                return scores
-                    
-        finally:
-            # Restore the original loader
-            chai_lab.chai1.load_exported = self.original_load_exported
+        return scores
 
 
 def score(pdb_files: list[Path], csv_output_path: Path, msa_directory: Path | None = None):

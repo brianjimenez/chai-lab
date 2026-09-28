@@ -591,10 +591,15 @@ def run_folding_on_context(
     seed: int | None = None,
     device: torch.device | None = None,
     low_memory: bool,
+    atom_coords: Tensor | None = None,
 ) -> StructureCandidates:
     """
     Function for in-depth explorations.
     User completely controls folding inputs.
+
+    If atom_coords (one row per atom of feature_context.structure_context) are
+    given, diffusion is skipped and the confidence head and ranking are run on
+    these coordinates instead, i.e. the given structure is scored.
     """
     # Set seed
     if seed is not None:
@@ -785,107 +790,123 @@ def run_folding_on_context(
 
     atom_single_mask = atom_single_mask.to(device)
 
-    static_diffusion_inputs = dict(
-        token_single_initial_repr=token_single_structure_input.float(),
-        token_pair_initial_repr=token_pair_structure_input_feats.float(),
-        token_single_trunk_repr=token_single_trunk_repr.float(),
-        token_pair_trunk_repr=token_pair_trunk_repr.float(),
-        atom_single_input_feats=atom_single_structure_input_feats.float(),
-        atom_block_pair_input_feats=block_atom_pair_structure_input_feats.float(),
-        atom_single_mask=atom_single_mask,
-        atom_block_pair_mask=block_atom_pair_mask,
-        token_single_mask=token_single_mask,
-        block_indices_h=block_indices_h,
-        block_indices_w=block_indices_w,
-        atom_token_indices=atom_token_indices,
-    )
-    static_diffusion_inputs = move_data_to_device(
-        static_diffusion_inputs, device=device
-    )
-
-    def _denoise(
-        diff_mod: ModuleWrapper, atom_pos: Tensor, sigma: Tensor, ds: int
-    ) -> Tensor:
-        # verified manually that ds dimension can be arbitrary in diff module
-        atom_noised_coords = rearrange(
-            atom_pos, "(b ds) ... -> b ds ...", ds=ds
-        ).contiguous()
-        noise_sigma = repeat(sigma, " -> b ds", b=batch_size, ds=ds)
-        return diff_mod.forward(
-            atom_noised_coords=atom_noised_coords.float(),
-            noise_sigma=noise_sigma.float(),
-            crop_size=model_size,
-            **static_diffusion_inputs,
+    if atom_coords is not None:
+        # Score the provided structure: skip diffusion and use the given coordinates
+        # (padding atoms, appended at the end, are left at the origin and masked)
+        assert num_diffn_samples == 1, "Only one sample when atom_coords are given"
+        n_input_atoms = feature_context.structure_context.num_atoms
+        assert tuple(atom_coords.shape) == (n_input_atoms, 3), atom_coords.shape
+        _, num_atoms = atom_single_mask.shape
+        atom_pos = torch.zeros(batch_size, num_atoms, 3, device=device)
+        atom_pos[:, :n_input_atoms] = atom_coords.float().to(device)
+    else:
+        static_diffusion_inputs = dict(
+            token_single_initial_repr=token_single_structure_input.float(),
+            token_pair_initial_repr=token_pair_structure_input_feats.float(),
+            token_single_trunk_repr=token_single_trunk_repr.float(),
+            token_pair_trunk_repr=token_pair_trunk_repr.float(),
+            atom_single_input_feats=atom_single_structure_input_feats.float(),
+            atom_block_pair_input_feats=block_atom_pair_structure_input_feats.float(),
+            atom_single_mask=atom_single_mask,
+            atom_block_pair_mask=block_atom_pair_mask,
+            token_single_mask=token_single_mask,
+            block_indices_h=block_indices_h,
+            block_indices_w=block_indices_w,
+            atom_token_indices=atom_token_indices,
+        )
+        static_diffusion_inputs = move_data_to_device(
+            static_diffusion_inputs, device=device
         )
 
-    inference_noise_schedule = InferenceNoiseSchedule(
-        s_max=DiffusionConfig.S_tmax,
-        s_min=4e-4,
-        p=7.0,
-        sigma_data=DiffusionConfig.sigma_data,
-    )
-    sigmas = inference_noise_schedule.get_schedule(
-        device=device, num_timesteps=num_diffn_timesteps
-    )
-    gammas = torch.where(
-        (sigmas >= DiffusionConfig.S_tmin) & (sigmas <= DiffusionConfig.S_tmax),
-        min(DiffusionConfig.S_churn / num_diffn_timesteps, math.sqrt(2) - 1),
-        0.0,
-    )
-
-    sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
-
-    # Initial atom positions
-    _, num_atoms = atom_single_mask.shape
-    atom_pos = sigmas[0] * torch.randn(
-        batch_size * num_diffn_samples, num_atoms, 3, device=device
-    )
-
-    with _component_moved_to("diffusion_module.pt", device=device) as diffusion_module:
-        for sigma_curr, sigma_next, gamma_curr in tqdm(
-            sigmas_and_gammas, desc="Diffusion steps"
-        ):
-            # Center coords
-            atom_pos = center_random_augmentation(
-                atom_pos,
-                atom_single_mask=repeat(
-                    atom_single_mask,
-                    "b a -> (b ds) a",
-                    ds=num_diffn_samples,
-                ),
+        def _denoise(
+            diff_mod: ModuleWrapper, atom_pos: Tensor, sigma: Tensor, ds: int
+        ) -> Tensor:
+            # verified manually that ds dimension can be arbitrary in diff module
+            atom_noised_coords = rearrange(
+                atom_pos, "(b ds) ... -> b ds ...", ds=ds
+            ).contiguous()
+            noise_sigma = repeat(sigma, " -> b ds", b=batch_size, ds=ds)
+            return diff_mod.forward(
+                atom_noised_coords=atom_noised_coords.float(),
+                noise_sigma=noise_sigma.float(),
+                crop_size=model_size,
+                **static_diffusion_inputs,
             )
 
-            # Alg 2. lines 4-6
-            noise = DiffusionConfig.S_noise * torch.randn(
-                atom_pos.shape, device=atom_pos.device
-            )
-            sigma_hat = sigma_curr + gamma_curr * sigma_curr
-            atom_pos_noise = (sigma_hat**2 - sigma_curr**2).clamp_min(1e-6).sqrt()
-            atom_pos_hat = atom_pos + noise * atom_pos_noise
+        inference_noise_schedule = InferenceNoiseSchedule(
+            s_max=DiffusionConfig.S_tmax,
+            s_min=4e-4,
+            p=7.0,
+            sigma_data=DiffusionConfig.sigma_data,
+        )
+        sigmas = inference_noise_schedule.get_schedule(
+            device=device, num_timesteps=num_diffn_timesteps
+        )
+        gammas = torch.where(
+            (sigmas >= DiffusionConfig.S_tmin) & (sigmas <= DiffusionConfig.S_tmax),
+            min(DiffusionConfig.S_churn / num_diffn_timesteps, math.sqrt(2) - 1),
+            0.0,
+        )
 
-            # Lines 7-8
-            denoised_pos = _denoise(
-                diff_mod=diffusion_module,
-                atom_pos=atom_pos_hat,
-                sigma=sigma_hat,
-                ds=num_diffn_samples,
-            )
-            d_i = (atom_pos_hat - denoised_pos) / sigma_hat
-            atom_pos = atom_pos_hat + (sigma_next - sigma_hat) * d_i
+        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
 
-            # Lines 9-11
-            if sigma_next != 0 and DiffusionConfig.second_order:  # second order update
+        # Initial atom positions
+        _, num_atoms = atom_single_mask.shape
+        atom_pos = sigmas[0] * torch.randn(
+            batch_size * num_diffn_samples, num_atoms, 3, device=device
+        )
+
+        with _component_moved_to(
+            "diffusion_module.pt", device=device
+        ) as diffusion_module:
+            for sigma_curr, sigma_next, gamma_curr in tqdm(
+                sigmas_and_gammas, desc="Diffusion steps"
+            ):
+                # Center coords
+                atom_pos = center_random_augmentation(
+                    atom_pos,
+                    atom_single_mask=repeat(
+                        atom_single_mask,
+                        "b a -> (b ds) a",
+                        ds=num_diffn_samples,
+                    ),
+                )
+
+                # Alg 2. lines 4-6
+                noise = DiffusionConfig.S_noise * torch.randn(
+                    atom_pos.shape, device=atom_pos.device
+                )
+                sigma_hat = sigma_curr + gamma_curr * sigma_curr
+                atom_pos_noise = (sigma_hat**2 - sigma_curr**2).clamp_min(1e-6).sqrt()
+                atom_pos_hat = atom_pos + noise * atom_pos_noise
+
+                # Lines 7-8
                 denoised_pos = _denoise(
                     diff_mod=diffusion_module,
-                    atom_pos=atom_pos,
-                    sigma=sigma_next,
+                    atom_pos=atom_pos_hat,
+                    sigma=sigma_hat,
                     ds=num_diffn_samples,
                 )
-                d_i_prime = (atom_pos - denoised_pos) / sigma_next
-                atom_pos = atom_pos + (sigma_next - sigma_hat) * ((d_i_prime + d_i) / 2)
+                d_i = (atom_pos_hat - denoised_pos) / sigma_hat
+                atom_pos = atom_pos_hat + (sigma_next - sigma_hat) * d_i
 
-    del static_diffusion_inputs
-    torch.cuda.empty_cache()
+                # Lines 9-11
+                if (
+                    sigma_next != 0 and DiffusionConfig.second_order
+                ):  # second order update
+                    denoised_pos = _denoise(
+                        diff_mod=diffusion_module,
+                        atom_pos=atom_pos,
+                        sigma=sigma_next,
+                        ds=num_diffn_samples,
+                    )
+                    d_i_prime = (atom_pos - denoised_pos) / sigma_next
+                    atom_pos = atom_pos + (sigma_next - sigma_hat) * (
+                        (d_i_prime + d_i) / 2
+                    )
+
+        del static_diffusion_inputs
+        torch.cuda.empty_cache()
 
     ##
     ## Run the confidence model
