@@ -139,6 +139,38 @@ class ChaiConfidenceScorer:
 
         return torch.from_numpy(coords), int((~found).sum())
 
+    @staticmethod
+    def _flatten_scores(raw_scores: dict[str, np.ndarray], chain_labels: list[str]) -> dict:
+        """
+        Turns Chai's score arrays into flat columns named by chain:
+        - ptm_<X>: pTM of chain X
+        - iptm_<X>_<Y>: ipTM of chain Y from the alignment on chain X (not symmetric)
+        - clashes_<X>_<Y>: number of clashing atom pairs between chains X and Y
+        The within-chain entries are left out: the pair ipTM diagonal repeats the
+        per-chain pTM, and intra-chain clashes are not used by Chai's ranking.
+        """
+        n = len(chain_labels)
+        per_chain_ptm = raw_scores['per_chain_ptm'].reshape(n)
+        pair_iptm = raw_scores['per_chain_pair_iptm'].reshape(n, n)
+        clashes = raw_scores['chain_chain_clashes'].reshape(n, n)
+
+        scores = {
+            'aggregate_score': float(raw_scores['aggregate_score'].item()),
+            'ptm': float(raw_scores['ptm'].item()),
+            'iptm': float(raw_scores['iptm'].item()),
+            'has_inter_chain_clashes': bool(raw_scores['has_inter_chain_clashes'].item()),
+        }
+        for i, x in enumerate(chain_labels):
+            scores[f'ptm_{x}'] = float(per_chain_ptm[i])
+        for i, x in enumerate(chain_labels):
+            for j, y in enumerate(chain_labels):
+                if i != j:
+                    scores[f'iptm_{x}_{y}'] = float(pair_iptm[i, j])
+        for i, x in enumerate(chain_labels):
+            for j, y in enumerate(chain_labels[i + 1:], start=i + 1):
+                scores[f'clashes_{x}_{y}'] = int(clashes[i, j])
+        return scores
+
     def score_pdb(self, pdb_file_path: str) -> dict:
         """
         Runs the sequence through the Chai trunk and scores the PDB coordinates
@@ -194,10 +226,8 @@ class ChaiConfidenceScorer:
                 atom_coords=atom_coords,
             )
 
-        # Scores: 'aggregate_score', 'ptm', 'iptm', 'per_chain_ptm', 'per_chain_pair_iptm', 'has_inter_chain_clashes', 'chain_chain_clashes'
-        scores = {}
-        for score, value in get_scores(candidates.ranking_data[0]).items():
-            scores[score] = float(value.flatten()[0])
+        chain_labels = [chain_id.strip() or f"chain{i + 1}" for i, (chain_id, _) in enumerate(chains)]
+        scores = self._flatten_scores(get_scores(candidates.ranking_data[0]), chain_labels)
 
         scores['rebuilt_atoms'] = num_rebuilt
         if msa_coverage is not None:
@@ -233,14 +263,15 @@ def score(
     total = len(pdb_files)
     print(f"Scoring {total} structures:")
     for pdb_file in pdb_files:
-        pdb_scores = scorer.score_pdb(pdb_file)
-        pdb_scores['structure'] = pdb_file.name
+        pdb_scores = {'structure': pdb_file.name, **scorer.score_pdb(pdb_file)}
         scores.append(pdb_scores)
         print(f"  > Run {i} / {total}: {pdb_scores}")
         i += 1
 
-    headers = scores[0].keys()
+    # Per-chain columns depend on each structure's chains: write the union of all
+    # columns, leaving the ones a structure does not have empty
+    headers = list(dict.fromkeys(key for pdb_scores in scores for key in pdb_scores))
     with open(csv_output_path, "w", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=headers)
+        writer = csv.DictWriter(csv_file, fieldnames=headers, restval="")
         writer.writeheader()
         writer.writerows(scores)
