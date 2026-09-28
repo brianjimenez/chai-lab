@@ -44,8 +44,12 @@ class ChaiConfidenceScorer:
         self,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         msa_directory: Path | None = None,
+        num_trunk_recycles: int = 3,
     ):
         self.device = device
+        if num_trunk_recycles < 1:
+            raise ValueError(f"num_trunk_recycles must be >= 1, got {num_trunk_recycles}")
+        self.num_trunk_recycles = num_trunk_recycles
         if msa_directory is not None and not Path(msa_directory).is_dir():
             raise NotADirectoryError(f"MSA directory not found: {msa_directory}")
         self.msa_directory = Path(msa_directory) if msa_directory is not None else None
@@ -183,7 +187,7 @@ class ChaiConfidenceScorer:
             candidates = run_folding_on_context(
                 feature_context,
                 output_dir=base_path / "chai_outputs",
-                num_trunk_recycles=1,
+                num_trunk_recycles=self.num_trunk_recycles,
                 num_diffn_samples=1,
                 device=device,
                 low_memory=True,
@@ -202,16 +206,25 @@ class ChaiConfidenceScorer:
         return scores
 
 
-def score(pdb_files: list[Path], csv_output_path: Path, msa_directory: Path | None = None):
+def score(
+    pdb_files: list[Path],
+    csv_output_path: Path,
+    msa_directory: Path | None = None,
+    num_trunk_recycles: int = 3,
+):
     """
     Scores a list of PDB structures through the confidence head and
     write the result in a CSV output file.
 
     If msa_directory is given, precomputed MSAs (.aligned.pqt files named by
     sequence hash, e.g. from `chai-lab a3m-to-pqt`) are used by the trunk.
+    num_trunk_recycles defaults to 3, as in `chai-lab fold`, so that scores
+    are comparable to regular Chai-1 predictions.
     """
     print("Loading model...")
-    scorer = ChaiConfidenceScorer(msa_directory=msa_directory)
+    scorer = ChaiConfidenceScorer(
+        msa_directory=msa_directory, num_trunk_recycles=num_trunk_recycles
+    )
     if msa_directory is not None:
         print(f"Using MSAs from {msa_directory}")
     print("Done.")
