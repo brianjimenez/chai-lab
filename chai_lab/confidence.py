@@ -9,14 +9,40 @@ from Bio.PDB import PDBParser
 try:
     import chai_lab.chai1
     from chai_lab.chai1 import run_inference
+    from chai_lab.data.parsing.msas.aligned_pqt import expected_basename
 except ImportError:
     raise ImportError("chai_lab is not installed. Please install it via: pip install -e .")
 
 class ChaiConfidenceScorer:
-    def __init__(self, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(
+        self,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        msa_directory: Path | None = None,
+    ):
         self.device = device
+        if msa_directory is not None and not Path(msa_directory).is_dir():
+            raise NotADirectoryError(f"MSA directory not found: {msa_directory}")
+        self.msa_directory = Path(msa_directory) if msa_directory is not None else None
         # Save the original loader so we can restore it later
         self.original_load_exported = chai_lab.chai1.load_exported
+
+    def _check_msa_coverage(self, fasta_content: str) -> tuple[int, int]:
+        """
+        Chai looks up MSAs by the hash of each chain sequence and silently falls
+        back to single-sequence mode when no .aligned.pqt file matches. As the
+        sequences here are derived from the PDB (which may miss residues), report
+        the chains without a matching MSA file.
+        """
+        lines = fasta_content.splitlines()
+        found = 0
+        for header, seq in zip(lines[0::2], lines[1::2]):
+            msa_file = self.msa_directory / expected_basename(seq)
+            if msa_file.is_file():
+                found += 1
+            else:
+                print(f">> Warning: no MSA found for {header[1:]} (expected {msa_file.name}). "
+                      "This chain will be scored in single-sequence mode.")
+        return found, len(lines) // 2
 
     def _extract_fasta_and_coords(self, pdb_path: str):
         """
@@ -74,6 +100,11 @@ class ChaiConfidenceScorer:
         
         if len(pdb_coords) == 0:
             raise ValueError("No valid amino acid CA coordinates found in PDB.")
+
+        msa_coverage = None
+        if self.msa_directory is not None:
+            found, total = self._check_msa_coverage(fasta_content)
+            msa_coverage = f"{found}/{total}"
 
         # Proxy class to intercept the confidence head
         class ConfidenceHeadProxy:
@@ -154,7 +185,8 @@ class ChaiConfidenceScorer:
                     fasta_file=tmp_fasta,
                     output_dir=chai_output_dir, 
                     num_trunk_recycles=1,       
-                    num_diffn_timesteps=1,      
+                    num_diffn_timesteps=1,
+                    msa_directory=self.msa_directory,
                     device=self.device
                 )
                 
@@ -173,7 +205,10 @@ class ChaiConfidenceScorer:
                 scores = {}
                 for score in data.keys():
                     scores[score] = float(data[score].flatten()[0])
-                
+
+                if msa_coverage is not None:
+                    scores['msa_chains'] = msa_coverage
+
                 return scores
                     
         finally:
@@ -181,13 +216,18 @@ class ChaiConfidenceScorer:
             chai_lab.chai1.load_exported = self.original_load_exported
 
 
-def score(pdb_files: list[Path], csv_output_path: Path):
+def score(pdb_files: list[Path], csv_output_path: Path, msa_directory: Path | None = None):
     """
-    Scores a list of PDB structures through the confidence head and 
-    write the result in a CSV output file. 
+    Scores a list of PDB structures through the confidence head and
+    write the result in a CSV output file.
+
+    If msa_directory is given, precomputed MSAs (.aligned.pqt files named by
+    sequence hash, e.g. from `chai-lab a3m-to-pqt`) are used by the trunk.
     """
     print("Loading model...")
-    scorer = ChaiConfidenceScorer()
+    scorer = ChaiConfidenceScorer(msa_directory=msa_directory)
+    if msa_directory is not None:
+        print(f"Using MSAs from {msa_directory}")
     print("Done.")
     scores = []
     i = 1
