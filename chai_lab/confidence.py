@@ -1,4 +1,5 @@
 import csv
+import os
 import string
 import tempfile
 from pathlib import Path
@@ -47,6 +48,30 @@ THREE_TO_ONE = {
     "TRP": "W",
     "TYR": "Y",
 }
+
+
+def make_deterministic():
+    """
+    Makes scores reproducible on GPU. Otherwise the same structure can score
+    differently from run to run (seen: aggregate score from 0.43 to 0.59), from
+    two sources that seeding does not control:
+    - non-deterministic CUDA kernels;
+    - the TorchScript executor of Chai's exported components, which switches to
+      fused kernels after the first calls, so the first structure scored in a
+      process gets different numbers than the next ones.
+    Affects the whole process; call it before any CUDA work.
+    """
+    # Needed by deterministic cuBLAS; only read when cuBLAS is initialized
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch._C._jit_set_profiling_executor(False)
+    torch._C._jit_set_profiling_mode(False)
+    torch._C._jit_override_can_fuse_on_gpu(False)
+    torch._C._jit_set_texpr_fuser_enabled(False)
 
 
 def _superimpose(
@@ -452,6 +477,7 @@ def score(
     csv_output_path: Path,
     msa_directory: Path | None = None,
     num_trunk_recycles: int = 3,
+    deterministic: bool = True,
 ):
     """
     Scores a list of PDB structures through the confidence head and
@@ -465,7 +491,11 @@ def score(
     sequence, trimmed of the extra terminal residues (msa_trimmed column).
     num_trunk_recycles defaults to 3, as in `chai-lab fold`, so that scores
     are comparable to regular Chai-1 predictions.
+    With deterministic (default), a structure always gets the same scores (see
+    make_deterministic); --no-deterministic may be faster on some GPUs.
     """
+    if deterministic:
+        make_deterministic()
     print("Loading model...")
     scorer = ChaiConfidenceScorer(
         msa_directory=msa_directory, num_trunk_recycles=num_trunk_recycles
