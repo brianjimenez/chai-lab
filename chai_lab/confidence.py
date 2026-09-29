@@ -2,6 +2,7 @@ import csv
 import string
 import tempfile
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -80,26 +81,52 @@ class ChaiConfidenceScorer:
         if msa_directory is not None and not Path(msa_directory).is_dir():
             raise NotADirectoryError(f"MSA directory not found: {msa_directory}")
         self.msa_directory = Path(msa_directory) if msa_directory is not None else None
+        self._msa_file_index: dict[str, Path] | None = None
         self._msa_query_index: dict[str, Path] | None = None
+
+    @staticmethod
+    def _index_msa_files(root: Path) -> dict[str, Path]:
+        """
+        Maps the name of every .aligned.pqt file in root and its subfolders to
+        its path. When a name occurs in several folders, the copy closest to root
+        (then first in path order) is used.
+        """
+        index: dict[str, Path] = {}
+        paths = root.rglob("*.aligned.pqt")
+        for path in sorted(paths, key=lambda p: (len(p.parts), p)):
+            index.setdefault(path.name, path)
+        return index
+
+    @staticmethod
+    def _index_msa_queries(paths: Iterable[Path]) -> dict[str, Path]:
+        """Maps the query sequence (first row) of each MSA file to its path."""
+        index: dict[str, Path] = {}
+        for path in paths:
+            batch = next(
+                pq.ParquetFile(path).iter_batches(batch_size=1, columns=["sequence"])
+            )
+            index.setdefault(batch.column("sequence")[0].as_py().upper(), path)
+        return index
+
+    def _msa_files(self) -> dict[str, Path]:
+        """All the MSA files under the MSA directory, indexed once."""
+        if self._msa_file_index is None:
+            self._msa_file_index = self._index_msa_files(self.msa_directory)
+        return self._msa_file_index
 
     def _msa_queries(self) -> dict[str, Path]:
         """
-        Maps the query sequence of every .aligned.pqt file in the MSA directory to
-        its path. Only read (once) when a chain has no exact MSA match.
+        Query sequences of all the MSA files under the MSA directory. Only read
+        (once) when a chain has no exact MSA match in its structure's folder.
         """
         if self._msa_query_index is None:
-            self._msa_query_index = {}
-            for path in sorted(self.msa_directory.glob("*.aligned.pqt")):
-                batch = next(
-                    pq.ParquetFile(path).iter_batches(
-                        batch_size=1, columns=["sequence"]
-                    )
-                )
-                query = batch.column("sequence")[0].as_py().upper()
-                self._msa_query_index.setdefault(query, path)
+            self._msa_query_index = self._index_msa_queries(self._msa_files().values())
         return self._msa_query_index
 
-    def _find_trimmable_msa(self, seq: str) -> tuple[Path, int, int] | None:
+    @staticmethod
+    def _find_trimmable_msa(
+        seq: str, queries: dict[str, Path]
+    ) -> tuple[Path, int, int] | None:
         """
         Finds an MSA whose query contains seq, i.e. was built for the same chain
         with extra terminal residues (e.g. residues not modelled in the PDB).
@@ -108,12 +135,32 @@ class ChaiConfidenceScorer:
         """
         matches = [
             (path, query.find(seq), len(query) - len(seq) - query.find(seq))
-            for query, path in self._msa_queries().items()
+            for query, path in queries.items()
             if query.count(seq) == 1
         ]
         if not matches:
             return None
         return min(matches, key=lambda m: m[1] + m[2])
+
+    def _find_msa(
+        self, seq: str, own_files: dict[str, Path]
+    ) -> tuple[Path, int, int] | None:
+        """
+        Finds the MSA for seq, first among the structure's own MSA files, then in
+        the whole MSA directory; in each, an exact match first, then an MSA to
+        trim. Returns its path and the number of extra N- and C-terminal residues.
+        """
+        name = expected_basename(seq)
+        if name in own_files:
+            return own_files[name], 0, 0
+        match = self._find_trimmable_msa(
+            seq, self._index_msa_queries(own_files.values())
+        )
+        if match is not None:
+            return match
+        if name in self._msa_files():
+            return self._msa_files()[name], 0, 0
+        return self._find_trimmable_msa(seq, self._msa_queries())
 
     @staticmethod
     def _trim_a3m_row(row: str, start: int, end: int) -> str:
@@ -153,17 +200,29 @@ class ChaiConfidenceScorer:
         table[is_query | has_residues].to_parquet(out_path, index=False)
 
     def _prepare_msas(
-        self, chains: list[tuple[str, list[Residue]]], fasta_content: str, msa_dir: Path
+        self,
+        chains: list[tuple[str, list[Residue]]],
+        fasta_content: str,
+        structure_name: str,
+        msa_dir: Path,
     ) -> tuple[int, list[str]]:
         """
         Chai looks up MSAs by the hash of each chain sequence and silently falls
-        back to single-sequence mode when no .aligned.pqt file matches. As the
-        sequences here are derived from the PDB, they may miss terminal residues
-        present in the sequence the MSA was built for. For each chain, links the
-        exact MSA into msa_dir or, failing that, writes a trimmed copy of an MSA
-        whose query contains the chain sequence.
+        back to single-sequence mode when no .aligned.pqt file matches. For each
+        chain, links its MSA into msa_dir or, as the sequences here are derived
+        from the PDB and may miss terminal residues present in the sequence the
+        MSA was built for, writes a trimmed copy of an MSA whose query contains
+        the chain sequence.
+
+        MSAs are searched first in the subfolder named after the structure (if
+        any): MSAs of a complex are often built together, with pairing keys that
+        only match within the complex, so a file with the same name in another
+        structure's folder can hold a different MSA.
         Returns the number of chains with an MSA and a note for each trimmed one.
         """
+        own_dir = self.msa_directory / structure_name
+        own_files = self._index_msa_files(own_dir) if own_dir.is_dir() else {}
+
         found = 0
         trimmed = []
         for (chain_id, _), seq in zip(chains, fasta_content.splitlines()[1::2]):
@@ -171,25 +230,31 @@ class ChaiConfidenceScorer:
             if target.exists():  # Chain sharing its sequence with a previous one
                 found += 1
                 continue
-            exact = self.msa_directory / expected_basename(seq)
-            if exact.is_file():
-                target.symlink_to(exact.resolve())
-                found += 1
-                continue
-            match = self._find_trimmable_msa(seq)
+            match = self._find_msa(seq, own_files)
             if match is None:
                 print(
-                    f">> Warning: no MSA found for chain {chain_id} (expected {exact.name}). "
+                    f">> Warning: no MSA found for chain {chain_id} "
+                    f"(expected {expected_basename(seq)}). "
                     "This chain will be scored in single-sequence mode."
                 )
                 continue
             msa_path, n_extra, c_extra = match
+            if own_files and own_dir not in msa_path.parents:
+                print(
+                    f">> Warning: no MSA for chain {chain_id} in {own_dir.name}/; using "
+                    f"{msa_path.relative_to(self.msa_directory)}, whose pairing with "
+                    "the other chains may not match."
+                )
+            found += 1
+            if n_extra == 0 and c_extra == 0:
+                target.symlink_to(msa_path.resolve())
+                continue
             print(
-                f">> Warning: no exact MSA for chain {chain_id}; using {msa_path.name} "
+                f">> Warning: no exact MSA for chain {chain_id}; using "
+                f"{msa_path.relative_to(self.msa_directory)} "
                 f"trimmed by {n_extra} N-terminal and {c_extra} C-terminal residues."
             )
             self._write_trimmed_msa(msa_path, n_extra, c_extra, target)
-            found += 1
             trimmed.append(f"{chain_id}(N{n_extra},C{c_extra})")
         return found, trimmed
 
@@ -325,7 +390,9 @@ class ChaiConfidenceScorer:
             if self.msa_directory is not None:
                 msa_dir = base_path / "msas"
                 msa_dir.mkdir()
-                found, trimmed = self._prepare_msas(chains, fasta_content, msa_dir)
+                found, trimmed = self._prepare_msas(
+                    chains, fasta_content, path.stem, msa_dir
+                )
 
             tmp_fasta = base_path / "input.fasta"
             tmp_fasta.write_text(fasta_content)
@@ -391,7 +458,9 @@ def score(
     write the result in a CSV output file.
 
     If msa_directory is given, precomputed MSAs (.aligned.pqt files named by
-    sequence hash, e.g. from `chai-lab a3m-to-pqt`) are used by the trunk.
+    sequence hash, e.g. from `chai-lab a3m-to-pqt`) found in it or any of its
+    subfolders are used by the trunk. The subfolder named after a PDB file (e.g.
+    <msa_directory>/complex_1/ for complex_1.pdb) is searched first.
     A chain without an exact match uses an MSA whose query contains its
     sequence, trimmed of the extra terminal residues (msa_trimmed column).
     num_trunk_recycles defaults to 3, as in `chai-lab fold`, so that scores
