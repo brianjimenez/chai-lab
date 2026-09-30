@@ -1,7 +1,10 @@
 import csv
+import functools
+import json
 import os
 import string
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
@@ -72,6 +75,43 @@ def make_deterministic():
     torch._C._jit_set_profiling_mode(False)
     torch._C._jit_override_can_fuse_on_gpu(False)
     torch._C._jit_set_texpr_fuser_enabled(False)
+
+
+def keep_models_resident():
+    """
+    Speeds up scoring many structures in one process (process-wide):
+    - Chai's components and the ESM model stay on the GPU instead of being
+      moved to the CPU and back for every structure (needs the GPU memory to
+      hold them all at once);
+    - the conformer library is loaded once instead of once per structure.
+    """
+    import chai_lab.chai1 as chai1
+    import chai_lab.data.dataset.embeddings.esm as esm
+    import chai_lab.data.dataset.inference_dataset as inference_dataset
+
+    inference_dataset.RefConformerGenerator = functools.cache(
+        inference_dataset.RefConformerGenerator
+    )
+
+    @contextmanager
+    def component_resident(comp_key, device):
+        if comp_key not in chai1._component_cache:
+            chai1._component_cache[comp_key] = chai1.load_exported(comp_key, device)
+        yield chai1._component_cache[comp_key]
+
+    chai1._component_moved_to = component_resident
+
+    original_esm_model = esm.esm_model.__wrapped__
+
+    @contextmanager
+    def esm_resident(device):
+        if not esm._esm_model:
+            # Loads the model onto the device; the generator is never resumed,
+            # so it is not moved back to the CPU
+            next(original_esm_model(device))
+        yield esm._esm_model[0]
+
+    esm.esm_model = esm_resident
 
 
 def _superimpose(
@@ -472,12 +512,46 @@ class ChaiConfidenceScorer:
         return scores
 
 
+def _partial_path(csv_output_path: Path) -> Path:
+    return Path(f"{csv_output_path}.partial.jsonl")
+
+
+def _load_partial_scores(partial_path: Path, settings: dict) -> dict[str, dict]:
+    """
+    Reads the scores saved by an interrupted run: the first line holds the
+    settings of that run, then one line of scores per structure. A truncated
+    last line (crash while writing) is dropped. Raises if the settings differ,
+    since scores from different settings must not be mixed.
+    """
+    lines = partial_path.read_text().splitlines()
+    try:
+        saved_settings = json.loads(lines[0])
+    except (IndexError, json.JSONDecodeError):
+        return {}  # Interrupted before the settings were written: nothing to keep
+    if saved_settings != settings:
+        raise ValueError(
+            f"{partial_path} comes from a run with different settings "
+            f"({saved_settings} instead of {settings}). Delete it or use "
+            "--no-resume to start over."
+        )
+    scores = {}
+    for line in lines[1:]:
+        try:
+            pdb_scores = json.loads(line)
+        except json.JSONDecodeError:
+            break
+        scores[pdb_scores["structure"]] = pdb_scores
+    return scores
+
+
 def score(
     pdb_files: list[Path],
     csv_output_path: Path,
     msa_directory: Path | None = None,
     num_trunk_recycles: int = 3,
     deterministic: bool = True,
+    keep_models_on_gpu: bool = True,
+    resume: bool = True,
 ):
     """
     Scores a list of PDB structures through the confidence head and
@@ -493,9 +567,30 @@ def score(
     are comparable to regular Chai-1 predictions.
     With deterministic (default), a structure always gets the same scores (see
     make_deterministic); --no-deterministic may be faster on some GPUs.
+    With keep_models_on_gpu (default), the models stay on the GPU between
+    structures, which is faster but needs more GPU memory (see
+    keep_models_resident); --no-keep-models-on-gpu offloads them as `fold` does.
+    Each structure's scores are saved to <csv_output_path>.partial.jsonl as soon
+    as they are computed, and the file is deleted once the CSV is written. If a
+    run is interrupted, running it again with the same settings continues where
+    it stopped (only with deterministic, so that scores stay comparable);
+    --no-resume starts over.
     """
+    partial_path = _partial_path(csv_output_path)
+    settings = {
+        "msa_directory": None if msa_directory is None else str(msa_directory),
+        "num_trunk_recycles": num_trunk_recycles,
+        "deterministic": deterministic,
+    }
+    done: dict[str, dict] = {}
+    if resume and deterministic and partial_path.is_file():
+        done = _load_partial_scores(partial_path, settings)
+    elif resume and partial_path.is_file():
+        print(f"Not resuming from {partial_path}: --no-deterministic scores vary.")
     if deterministic:
         make_deterministic()
+    if keep_models_on_gpu:
+        keep_models_resident()
     print("Loading model...")
     scorer = ChaiConfidenceScorer(
         msa_directory=msa_directory, num_trunk_recycles=num_trunk_recycles
@@ -503,15 +598,27 @@ def score(
     if msa_directory is not None:
         print(f"Using MSAs from {msa_directory}")
     print("Done.")
-    scores = []
-    i = 1
     total = len(pdb_files)
-    print(f"Scoring {total} structures:")
-    for pdb_file in pdb_files:
-        pdb_scores = {"structure": pdb_file.name, **scorer.score_pdb(pdb_file)}
-        scores.append(pdb_scores)
-        print(f"  > Run {i} / {total}: {pdb_scores}")
-        i += 1
+    pending = [f for f in pdb_files if f.name not in done]
+    if done:
+        print(f"Resuming: {total - len(pending)} / {total} already scored")
+    print(f"Scoring {len(pending)} structures:")
+    # Rewritten through a temporary file so that a crash here cannot lose the
+    # scores of the interrupted run
+    tmp_path = partial_path.with_name(partial_path.name + ".tmp")
+    tmp_path.write_text(
+        "".join(json.dumps(x) + "\n" for x in [settings, *done.values()])
+    )
+    os.replace(tmp_path, partial_path)
+    with open(partial_path, "a") as partial_file:
+        for i, pdb_file in enumerate(pending, start=1):
+            pdb_scores = {"structure": pdb_file.name, **scorer.score_pdb(pdb_file)}
+            done[pdb_file.name] = pdb_scores
+            partial_file.write(json.dumps(pdb_scores) + "\n")
+            partial_file.flush()
+            print(f"  > Run {i} / {len(pending)}: {pdb_scores}")
+
+    scores = [done[f.name] for f in pdb_files]
 
     # Per-chain columns depend on each structure's chains: write the union of all
     # columns, leaving the ones a structure does not have empty
@@ -520,3 +627,4 @@ def score(
         writer = csv.DictWriter(csv_file, fieldnames=headers, restval="")
         writer.writeheader()
         writer.writerows(scores)
+    partial_path.unlink()
