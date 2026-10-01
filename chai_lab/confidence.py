@@ -1,207 +1,630 @@
 import csv
-import torch
-import numpy as np
+import functools
+import json
+import os
+import string
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import torch
 from Bio.PDB import PDBParser
+from Bio.PDB.Residue import Residue
 
 # Import chai_lab core modules
 try:
-    import chai_lab.chai1
-    from chai_lab.chai1 import run_inference
+    from chai_lab.chai1 import make_all_atom_feature_context, run_folding_on_context
+    from chai_lab.data.dataset.structure.all_atom_structure_context import (
+        AllAtomStructureContext,
+    )
+    from chai_lab.data.parsing.msas.aligned_pqt import expected_basename
+    from chai_lab.ranking.rank import get_scores
 except ImportError:
-    raise ImportError("chai_lab is not installed. Please install it via: pip install -e .")
+    raise ImportError(
+        "chai_lab is not installed. Please install it via: pip install -e ."
+    )
+
+# Standard amino acid mapping to avoid Biopython versioning issues
+THREE_TO_ONE = {
+    "ALA": "A",
+    "CYS": "C",
+    "ASP": "D",
+    "GLU": "E",
+    "PHE": "F",
+    "GLY": "G",
+    "HIS": "H",
+    "ILE": "I",
+    "LYS": "K",
+    "LEU": "L",
+    "MET": "M",
+    "ASN": "N",
+    "PRO": "P",
+    "GLN": "Q",
+    "ARG": "R",
+    "SER": "S",
+    "THR": "T",
+    "VAL": "V",
+    "TRP": "W",
+    "TYR": "Y",
+}
+
+
+def make_deterministic():
+    """
+    Makes scores reproducible on GPU. Otherwise the same structure can score
+    differently from run to run (seen: aggregate score from 0.43 to 0.59), from
+    two sources that seeding does not control:
+    - non-deterministic CUDA kernels;
+    - the TorchScript executor of Chai's exported components, which switches to
+      fused kernels after the first calls, so the first structure scored in a
+      process gets different numbers than the next ones.
+    Affects the whole process; call it before any CUDA work.
+    """
+    # Needed by deterministic cuBLAS; only read when cuBLAS is initialized
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch._C._jit_set_profiling_executor(False)
+    torch._C._jit_set_profiling_mode(False)
+    torch._C._jit_override_can_fuse_on_gpu(False)
+    torch._C._jit_set_texpr_fuser_enabled(False)
+
+
+def keep_models_resident():
+    """
+    Speeds up scoring many structures in one process (process-wide):
+    - Chai's components and the ESM model stay on the GPU instead of being
+      moved to the CPU and back for every structure (needs the GPU memory to
+      hold them all at once);
+    - the conformer library is loaded once instead of once per structure.
+    """
+    import chai_lab.chai1 as chai1
+    import chai_lab.data.dataset.embeddings.esm as esm
+    import chai_lab.data.dataset.inference_dataset as inference_dataset
+
+    inference_dataset.RefConformerGenerator = functools.cache(
+        inference_dataset.RefConformerGenerator
+    )
+
+    @contextmanager
+    def component_resident(comp_key, device):
+        if comp_key not in chai1._component_cache:
+            chai1._component_cache[comp_key] = chai1.load_exported(comp_key, device)
+        yield chai1._component_cache[comp_key]
+
+    chai1._component_moved_to = component_resident
+
+    original_esm_model = esm.esm_model.__wrapped__
+
+    @contextmanager
+    def esm_resident(device):
+        if not esm._esm_model:
+            # Loads the model onto the device; the generator is never resumed,
+            # so it is not moved back to the CPU
+            next(original_esm_model(device))
+        yield esm._esm_model[0]
+
+    esm.esm_model = esm_resident
+
+
+def _superimpose(
+    mobile: np.ndarray, target: np.ndarray, points: np.ndarray
+) -> np.ndarray:
+    """
+    Finds the rigid transform (Kabsch) that best superimposes mobile onto target
+    and applies it to points.
+    """
+    mobile_center = mobile.mean(axis=0)
+    target_center = target.mean(axis=0)
+    h = (mobile - mobile_center).T @ (target - target_center)
+    u, _, vt = np.linalg.svd(h)
+    d = np.sign(np.linalg.det(vt.T @ u.T))
+    rotation = vt.T @ np.diag([1.0, 1.0, d]) @ u.T
+    return (points - mobile_center) @ rotation.T + target_center
+
 
 class ChaiConfidenceScorer:
-    def __init__(self, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(
+        self,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        msa_directory: Path | None = None,
+        num_trunk_recycles: int = 3,
+    ):
         self.device = device
-        # Save the original loader so we can restore it later
-        self.original_load_exported = chai_lab.chai1.load_exported
+        if num_trunk_recycles < 1:
+            raise ValueError(
+                f"num_trunk_recycles must be >= 1, got {num_trunk_recycles}"
+            )
+        self.num_trunk_recycles = num_trunk_recycles
+        if msa_directory is not None and not Path(msa_directory).is_dir():
+            raise NotADirectoryError(f"MSA directory not found: {msa_directory}")
+        self.msa_directory = Path(msa_directory) if msa_directory is not None else None
+        self._msa_file_index: dict[str, Path] | None = None
+        self._msa_query_index: dict[str, Path] | None = None
 
-    def _extract_fasta_and_coords(self, pdb_path: str):
+    @staticmethod
+    def _index_msa_files(root: Path) -> dict[str, Path]:
         """
-        Parses the PDB to extract the amino acid sequence (FASTA) 
-        and the Carbon-Alpha (CA) coordinates.
+        Maps the name of every .aligned.pqt file in root and its subfolders to
+        its path. When a name occurs in several folders, the copy closest to root
+        (then first in path order) is used.
+        """
+        index: dict[str, Path] = {}
+        paths = root.rglob("*.aligned.pqt")
+        for path in sorted(paths, key=lambda p: (len(p.parts), p)):
+            index.setdefault(path.name, path)
+        return index
+
+    @staticmethod
+    def _index_msa_queries(paths: Iterable[Path]) -> dict[str, Path]:
+        """Maps the query sequence (first row) of each MSA file to its path."""
+        index: dict[str, Path] = {}
+        for path in paths:
+            batch = next(
+                pq.ParquetFile(path).iter_batches(batch_size=1, columns=["sequence"])
+            )
+            index.setdefault(batch.column("sequence")[0].as_py().upper(), path)
+        return index
+
+    def _msa_files(self) -> dict[str, Path]:
+        """All the MSA files under the MSA directory, indexed once."""
+        if self._msa_file_index is None:
+            self._msa_file_index = self._index_msa_files(self.msa_directory)
+        return self._msa_file_index
+
+    def _msa_queries(self) -> dict[str, Path]:
+        """
+        Query sequences of all the MSA files under the MSA directory. Only read
+        (once) when a chain has no exact MSA match in its structure's folder.
+        """
+        if self._msa_query_index is None:
+            self._msa_query_index = self._index_msa_queries(self._msa_files().values())
+        return self._msa_query_index
+
+    @staticmethod
+    def _find_trimmable_msa(
+        seq: str, queries: dict[str, Path]
+    ) -> tuple[Path, int, int] | None:
+        """
+        Finds an MSA whose query contains seq, i.e. was built for the same chain
+        with extra terminal residues (e.g. residues not modelled in the PDB).
+        Returns its path and the number of extra N- and C-terminal residues. When
+        several match, the one with the fewest extra residues is used.
+        """
+        matches = [
+            (path, query.find(seq), len(query) - len(seq) - query.find(seq))
+            for query, path in queries.items()
+            if query.count(seq) == 1
+        ]
+        if not matches:
+            return None
+        return min(matches, key=lambda m: m[1] + m[2])
+
+    def _find_msa(
+        self, seq: str, own_files: dict[str, Path]
+    ) -> tuple[Path, int, int] | None:
+        """
+        Finds the MSA for seq, first among the structure's own MSA files, then in
+        the whole MSA directory; in each, an exact match first, then an MSA to
+        trim. Returns its path and the number of extra N- and C-terminal residues.
+        """
+        name = expected_basename(seq)
+        if name in own_files:
+            return own_files[name], 0, 0
+        match = self._find_trimmable_msa(
+            seq, self._index_msa_queries(own_files.values())
+        )
+        if match is not None:
+            return match
+        if name in self._msa_files():
+            return self._msa_files()[name], 0, 0
+        return self._find_trimmable_msa(seq, self._msa_queries())
+
+    @staticmethod
+    def _trim_a3m_row(row: str, start: int, end: int) -> str:
+        """
+        Keeps the aligned columns [start, end) of an a3m row (uppercase letters and
+        '-' are aligned columns, other characters are insertions). Insertions are
+        kept only between kept columns.
+        """
+        out = []
+        col = 0
+        for c in row:
+            if c in string.ascii_uppercase or c == "-":
+                if start <= col < end:
+                    out.append(c)
+                col += 1
+            elif start < col < end:
+                out.append(c)
+        return "".join(out)
+
+    def _write_trimmed_msa(
+        self, msa_path: Path, n_extra: int, c_extra: int, out_path: Path
+    ):
+        """
+        Writes the MSA without its first n_extra and last c_extra aligned columns.
+        Hits that only aligned to the trimmed columns are dropped.
+        """
+        table = pd.read_parquet(msa_path)
+        n_cols = sum(
+            c in string.ascii_uppercase or c == "-" for c in table["sequence"].iloc[0]
+        )
+        end = n_cols - c_extra
+        table["sequence"] = [
+            self._trim_a3m_row(row, n_extra, end) for row in table["sequence"]
+        ]
+        is_query = table["source_database"] == "query"
+        has_residues = table["sequence"].str.contains(r"[A-Z]")
+        table[is_query | has_residues].to_parquet(out_path, index=False)
+
+    def _prepare_msas(
+        self,
+        chains: list[tuple[str, list[Residue]]],
+        fasta_content: str,
+        structure_name: str,
+        msa_dir: Path,
+    ) -> tuple[int, list[str]]:
+        """
+        Chai looks up MSAs by the hash of each chain sequence and silently falls
+        back to single-sequence mode when no .aligned.pqt file matches. For each
+        chain, links its MSA into msa_dir or, as the sequences here are derived
+        from the PDB and may miss terminal residues present in the sequence the
+        MSA was built for, writes a trimmed copy of an MSA whose query contains
+        the chain sequence.
+
+        MSAs are searched first in the subfolder named after the structure (if
+        any): MSAs of a complex are often built together, with pairing keys that
+        only match within the complex, so a file with the same name in another
+        structure's folder can hold a different MSA.
+        Returns the number of chains with an MSA and a note for each trimmed one.
+        """
+        own_dir = self.msa_directory / structure_name
+        own_files = self._index_msa_files(own_dir) if own_dir.is_dir() else {}
+
+        found = 0
+        trimmed = []
+        for (chain_id, _), seq in zip(chains, fasta_content.splitlines()[1::2]):
+            target = msa_dir / expected_basename(seq)
+            if target.exists():  # Chain sharing its sequence with a previous one
+                found += 1
+                continue
+            match = self._find_msa(seq, own_files)
+            if match is None:
+                print(
+                    f">> Warning: no MSA found for chain {chain_id} "
+                    f"(expected {expected_basename(seq)}). "
+                    "This chain will be scored in single-sequence mode."
+                )
+                continue
+            msa_path, n_extra, c_extra = match
+            if own_files and own_dir not in msa_path.parents:
+                print(
+                    f">> Warning: no MSA for chain {chain_id} in {own_dir.name}/; using "
+                    f"{msa_path.relative_to(self.msa_directory)}, whose pairing with "
+                    "the other chains may not match."
+                )
+            found += 1
+            if n_extra == 0 and c_extra == 0:
+                target.symlink_to(msa_path.resolve())
+                continue
+            print(
+                f">> Warning: no exact MSA for chain {chain_id}; using "
+                f"{msa_path.relative_to(self.msa_directory)} "
+                f"trimmed by {n_extra} N-terminal and {c_extra} C-terminal residues."
+            )
+            self._write_trimmed_msa(msa_path, n_extra, c_extra, target)
+            trimmed.append(f"{chain_id}(N{n_extra},C{c_extra})")
+        return found, trimmed
+
+    def _extract_chains(self, pdb_path: str) -> list[tuple[str, list[Residue]]]:
+        """
+        Parses the PDB and returns, for each protein chain of the first model,
+        its id and its standard amino acid residues.
         """
         parser = PDBParser(QUIET=True)
         structure = parser.get_structure("input", pdb_path)
-        
-        # Standard amino acid mapping to avoid Biopython versioning issues
-        three_to_one = {
-            'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E',
-            'PHE': 'F', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
-            'LYS': 'K', 'LEU': 'L', 'MET': 'M', 'ASN': 'N',
-            'PRO': 'P', 'GLN': 'Q', 'ARG': 'R', 'SER': 'S',
-            'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
-        }
-        
-        fasta_str = ""
-        ca_coords = []
-        
-        for model in structure:
-            for chain in model:
-                chain_seq = ""
-                for residue in chain:
-                    res_name = residue.get_resname().upper()
-                    
-                    # Check if it's a standard amino acid
-                    if res_name in three_to_one:
-                        chain_seq += three_to_one[res_name]
-                        
-                        # Extract CA coordinate (fallback to 0 if missing)
-                        if 'CA' in residue:
-                            ca_coords.append(residue['CA'].get_coord())
-                        else:
-                            ca_coords.append([0.0, 0.0, 0.0])
-                            
-                if chain_seq:
-                    fasta_str += f">protein|name=chain_{chain.id}\n{chain_seq}\n"
-            break # Only process the first model in the PDB
-            
-        return fasta_str, np.array(ca_coords)
+        model = next(iter(structure))  # Only process the first model in the PDB
 
-    def score_pdb(self, pdb_file_path: str) -> float:
+        chains = []
+        for chain in model:
+            residues = [r for r in chain if r.get_resname().upper() in THREE_TO_ONE]
+            if residues:
+                chains.append((chain.id, residues))
+        return chains
+
+    @staticmethod
+    def _to_fasta(chains: list[tuple[str, list[Residue]]]) -> str:
+        fasta_str = ""
+        for chain_id, residues in chains:
+            chain_seq = "".join(THREE_TO_ONE[r.get_resname().upper()] for r in residues)
+            fasta_str += f">protein|name=chain_{chain_id}\n{chain_seq}\n"
+        return fasta_str
+
+    @staticmethod
+    def _map_atom_coords(
+        structure_context: AllAtomStructureContext,
+        chains: list[tuple[str, list[Residue]]],
+    ) -> tuple[torch.Tensor, int]:
         """
-        Runs the sequence through the Chai trunk and injects the PDB 
-        coordinates into the confidence head to calculate the different scores.
+        Places the PDB atoms into Chai's atom layout, matching them by chain,
+        residue position and atom name. Heavy atoms missing in the PDB are rebuilt
+        by superimposing the residue's reference conformer onto the atoms present.
+        Returns the coordinates (one row per Chai atom) and the number of rebuilt atoms.
+        """
+        atom_token_index = structure_context.atom_token_index
+        atom_chain_index = (
+            structure_context.token_asym_id[atom_token_index] - 1
+        ).tolist()
+        atom_residue_index = structure_context.token_residue_index[
+            atom_token_index
+        ].tolist()
+        atom_names = structure_context.atom_ref_name
+
+        num_atoms = structure_context.num_atoms
+        coords = np.zeros((num_atoms, 3), dtype=np.float32)
+        found = np.zeros(num_atoms, dtype=bool)
+        for i in range(num_atoms):
+            _, residues = chains[atom_chain_index[i]]
+            residue = residues[atom_residue_index[i]]
+            if atom_names[i] in residue:
+                coords[i] = residue[atom_names[i]].get_coord()
+                found[i] = True
+
+        ref_pos = structure_context.atom_ref_pos.numpy()
+        atom_token_index = atom_token_index.numpy()
+        for token in np.unique(atom_token_index[~found]):
+            token_atoms = atom_token_index == token
+            present = token_atoms & found
+            missing = token_atoms & ~found
+            if present.sum() < 3:
+                chain_id, residues = chains[atom_chain_index[missing.argmax()]]
+                residue = residues[atom_residue_index[missing.argmax()]]
+                raise ValueError(
+                    f"Chain {chain_id} residue {residue.get_resname()}{residue.id[1]} has "
+                    f"only {present.sum()} heavy atoms; at least 3 are needed to rebuild the missing ones."
+                )
+            coords[missing] = _superimpose(
+                ref_pos[present], coords[present], ref_pos[missing]
+            )
+
+        return torch.from_numpy(coords), int((~found).sum())
+
+    @staticmethod
+    def _flatten_scores(
+        raw_scores: dict[str, np.ndarray], chain_labels: list[str]
+    ) -> dict:
+        """
+        Turns Chai's score arrays into flat columns named by chain:
+        - ptm_<X>: pTM of chain X
+        - iptm_<X>_<Y>: ipTM of chain Y from the alignment on chain X (not symmetric)
+        - clashes_<X>_<Y>: number of clashing atom pairs between chains X and Y
+        The within-chain entries are left out: the pair ipTM diagonal repeats the
+        per-chain pTM, and intra-chain clashes are not used by Chai's ranking.
+        """
+        n = len(chain_labels)
+        per_chain_ptm = raw_scores["per_chain_ptm"].reshape(n)
+        pair_iptm = raw_scores["per_chain_pair_iptm"].reshape(n, n)
+        clashes = raw_scores["chain_chain_clashes"].reshape(n, n)
+
+        scores = {
+            "aggregate_score": float(raw_scores["aggregate_score"].item()),
+            "ptm": float(raw_scores["ptm"].item()),
+            "iptm": float(raw_scores["iptm"].item()),
+            "has_inter_chain_clashes": bool(
+                raw_scores["has_inter_chain_clashes"].item()
+            ),
+        }
+        for i, x in enumerate(chain_labels):
+            scores[f"ptm_{x}"] = float(per_chain_ptm[i])
+        for i, x in enumerate(chain_labels):
+            for j, y in enumerate(chain_labels):
+                if i != j:
+                    scores[f"iptm_{x}_{y}"] = float(pair_iptm[i, j])
+        for i, x in enumerate(chain_labels):
+            for j, y in enumerate(chain_labels[i + 1 :], start=i + 1):
+                scores[f"clashes_{x}_{y}"] = int(clashes[i, j])
+        return scores
+
+    def score_pdb(self, pdb_file_path: str) -> dict:
+        """
+        Runs the sequence through the Chai trunk and scores the PDB coordinates
+        with the confidence head to calculate the different scores.
         """
         path = Path(pdb_file_path)
         if not path.is_file():
             raise FileNotFoundError(f"PDB file not found: {pdb_file_path}")
 
         print(f"Parsing {path.name}...")
-        fasta_content, pdb_coords = self._extract_fasta_and_coords(pdb_file_path)
-        
-        if len(pdb_coords) == 0:
-            raise ValueError("No valid amino acid CA coordinates found in PDB.")
+        chains = self._extract_chains(pdb_file_path)
+        if not chains:
+            raise ValueError("No standard amino acid residues found in PDB.")
+        fasta_content = self._to_fasta(chains)
 
-        # Proxy class to intercept the confidence head
-        class ConfidenceHeadProxy:
-            def __init__(self, original_module, pdb_coords):
-                self.original_module = original_module
-                self.pdb_coords = pdb_coords
+        device = torch.device(self.device)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir)
 
-            def __call__(self, *args, **kwargs):
-                print(">> Intercepting confidence head! Injecting custom PDB coordinates...")
-                
-                # Identify where the pred_coords are
-                is_kwarg = 'pred_coords' in kwargs
-                
-                if is_kwarg:
-                    original_coords = kwargs['pred_coords']
-                elif len(args) > 2:
-                    original_coords = args[2]
-                else:
-                    print(">> Warning: Could not locate pred_coords in arguments. Running original.")
-                    return self.original_module(*args, **kwargs)
-
-                modified_coords = original_coords.clone()
-                
-                # Convert our PDB coords to match the tensor properties
-                pdb_tensor = torch.tensor(
-                    self.pdb_coords, 
-                    dtype=original_coords.dtype, 
-                    device=original_coords.device
+            msa_dir = None
+            if self.msa_directory is not None:
+                msa_dir = base_path / "msas"
+                msa_dir.mkdir()
+                found, trimmed = self._prepare_msas(
+                    chains, fasta_content, path.stem, msa_dir
                 )
-                
-                L = min(pdb_tensor.shape[0], original_coords.shape[1])
-                
-                if len(original_coords.shape) == 3:
-                    modified_coords[0, :L, :] = pdb_tensor[:L, :]
-                elif len(original_coords.shape) == 4:
-                    modified_coords[0, :L, 1, :] = pdb_tensor[:L, :]
-                    
-                # Package the modified coordinates back into the arguments
-                if is_kwarg:
-                    kwargs['pred_coords'] = modified_coords
-                    new_args = args
-                else:
-                    new_args = list(args)
-                    new_args[2] = modified_coords
-                    
-                # Run the actual model with the injected coordinates
-                # The pipeline will calculate the pTM downstream from these outputs
-                return self.original_module(*new_args, **kwargs)
 
-            def __getattr__(self, name):
-                return getattr(self.original_module, name)
+            tmp_fasta = base_path / "input.fasta"
+            tmp_fasta.write_text(fasta_content)
 
-        def patched_load_exported(name, device):
-            module = self.original_load_exported(name, device)
-            
-            # Wrap the confidence head with our proxy
-            if "confidence_head" in name:
-                return ConfidenceHeadProxy(module, pdb_coords)
-                
-            return module
+            feature_context = make_all_atom_feature_context(
+                fasta_file=tmp_fasta,
+                output_dir=base_path / "features",
+                use_esm_embeddings=True,
+                msa_directory=msa_dir,
+                esm_device=device,
+            )
+            parsed_seqs = fasta_content.splitlines()[1::2]
+            chai_seqs = [chain.entity_data.sequence for chain in feature_context.chains]
+            assert (
+                chai_seqs == parsed_seqs
+            ), f"Sequence mismatch: {chai_seqs} != {parsed_seqs}"
 
-        # Apply patch and run the inference pipeline
-        chai_lab.chai1.load_exported = patched_load_exported
-        
+            atom_coords, num_rebuilt = self._map_atom_coords(
+                feature_context.structure_context, chains
+            )
+            if num_rebuilt > 0:
+                print(
+                    f">> Warning: rebuilt {num_rebuilt} heavy atoms missing in {path.name}."
+                )
+
+            print(
+                "Running Chai-1 trunk and scoring the PDB coordinates (skipping diffusion)..."
+            )
+            candidates = run_folding_on_context(
+                feature_context,
+                output_dir=base_path / "chai_outputs",
+                num_trunk_recycles=self.num_trunk_recycles,
+                num_diffn_samples=1,
+                device=device,
+                low_memory=True,
+                atom_coords=atom_coords,
+            )
+
+        chain_labels = [
+            chain_id.strip() or f"chain{i + 1}"
+            for i, (chain_id, _) in enumerate(chains)
+        ]
+        scores = self._flatten_scores(
+            get_scores(candidates.ranking_data[0]), chain_labels
+        )
+
+        scores["rebuilt_atoms"] = num_rebuilt
+        if self.msa_directory is not None:
+            scores["msa_chains"] = f"{found}/{len(chains)}"
+            scores["msa_trimmed"] = ";".join(trimmed)
+
+        return scores
+
+
+def _partial_path(csv_output_path: Path) -> Path:
+    return Path(f"{csv_output_path}.partial.jsonl")
+
+
+def _load_partial_scores(partial_path: Path, settings: dict) -> dict[str, dict]:
+    """
+    Reads the scores saved by an interrupted run: the first line holds the
+    settings of that run, then one line of scores per structure. A truncated
+    last line (crash while writing) is dropped. Raises if the settings differ,
+    since scores from different settings must not be mixed.
+    """
+    lines = partial_path.read_text().splitlines()
+    try:
+        saved_settings = json.loads(lines[0])
+    except (IndexError, json.JSONDecodeError):
+        return {}  # Interrupted before the settings were written: nothing to keep
+    if saved_settings != settings:
+        raise ValueError(
+            f"{partial_path} comes from a run with different settings "
+            f"({saved_settings} instead of {settings}). Delete it or use "
+            "--no-resume to start over."
+        )
+    scores = {}
+    for line in lines[1:]:
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                base_path = Path(tmpdir)
-                
-                tmp_fasta = base_path / "input.fasta"
-                tmp_fasta.write_text(fasta_content)
-                
-                chai_output_dir = base_path / "chai_outputs"
-                chai_output_dir.mkdir(exist_ok=True)
-                
-                print("Running Chai-1 trunk to generate embeddings (skipping diffusion)...")
-                
-                run_inference(
-                    fasta_file=tmp_fasta,
-                    output_dir=chai_output_dir, 
-                    num_trunk_recycles=1,       
-                    num_diffn_timesteps=1,      
-                    device=self.device
-                )
-                
-                # Dynamically locate the output .npz file
-                npz_files = list(chai_output_dir.glob("*.npz"))
-                
-                if not npz_files:
-                    print(f"Contents of output directory: {list(chai_output_dir.iterdir())}")
-                    raise RuntimeError("ERROR: Inference failed to produce any .npz score files.")
-                
-                # Read the first generated .npz file
-                target_file = npz_files[0]
-                data = np.load(target_file)
-                
-                # Scores: 'aggregate_score', 'ptm', 'iptm', 'per_chain_ptm', 'per_chain_pair_iptm', 'has_inter_chain_clashes', 'chain_chain_clashes'
-                scores = {}
-                for score in data.keys():
-                    scores[score] = float(data[score].flatten()[0])
-                
-                return scores
-                    
-        finally:
-            # Restore the original loader
-            chai_lab.chai1.load_exported = self.original_load_exported
+            pdb_scores = json.loads(line)
+        except json.JSONDecodeError:
+            break
+        scores[pdb_scores["structure"]] = pdb_scores
+    return scores
 
 
-def score(pdb_files: list[Path], csv_output_path: Path):
+def score(
+    pdb_files: list[Path],
+    csv_output_path: Path,
+    msa_directory: Path | None = None,
+    num_trunk_recycles: int = 3,
+    deterministic: bool = True,
+    keep_models_on_gpu: bool = True,
+    resume: bool = True,
+):
     """
-    Scores a list of PDB structures through the confidence head and 
-    write the result in a CSV output file. 
+    Scores a list of PDB structures through the confidence head and
+    write the result in a CSV output file.
+
+    If msa_directory is given, precomputed MSAs (.aligned.pqt files named by
+    sequence hash, e.g. from `chai-lab a3m-to-pqt`) found in it or any of its
+    subfolders are used by the trunk. The subfolder named after a PDB file (e.g.
+    <msa_directory>/complex_1/ for complex_1.pdb) is searched first.
+    A chain without an exact match uses an MSA whose query contains its
+    sequence, trimmed of the extra terminal residues (msa_trimmed column).
+    num_trunk_recycles defaults to 3, as in `chai-lab fold`, so that scores
+    are comparable to regular Chai-1 predictions.
+    With deterministic (default), a structure always gets the same scores (see
+    make_deterministic); --no-deterministic may be faster on some GPUs.
+    With keep_models_on_gpu (default), the models stay on the GPU between
+    structures, which is faster but needs more GPU memory (see
+    keep_models_resident); --no-keep-models-on-gpu offloads them as `fold` does.
+    Each structure's scores are saved to <csv_output_path>.partial.jsonl as soon
+    as they are computed, and the file is deleted once the CSV is written. If a
+    run is interrupted, running it again with the same settings continues where
+    it stopped (only with deterministic, so that scores stay comparable);
+    --no-resume starts over.
     """
+    partial_path = _partial_path(csv_output_path)
+    settings = {
+        "msa_directory": None if msa_directory is None else str(msa_directory),
+        "num_trunk_recycles": num_trunk_recycles,
+        "deterministic": deterministic,
+    }
+    done: dict[str, dict] = {}
+    if resume and deterministic and partial_path.is_file():
+        done = _load_partial_scores(partial_path, settings)
+    elif resume and partial_path.is_file():
+        print(f"Not resuming from {partial_path}: --no-deterministic scores vary.")
+    if deterministic:
+        make_deterministic()
+    if keep_models_on_gpu:
+        keep_models_resident()
     print("Loading model...")
-    scorer = ChaiConfidenceScorer()
+    scorer = ChaiConfidenceScorer(
+        msa_directory=msa_directory, num_trunk_recycles=num_trunk_recycles
+    )
+    if msa_directory is not None:
+        print(f"Using MSAs from {msa_directory}")
     print("Done.")
-    scores = []
-    i = 1
     total = len(pdb_files)
-    print(f"Scoring {total} structures:")
-    for pdb_file in pdb_files:
-        pdb_scores = scorer.score_pdb(pdb_file)
-        pdb_scores['structure'] = pdb_file.name
-        scores.append(pdb_scores)
-        print(f"  > Run {i} / {total}: {pdb_scores}")
-        i += 1
+    pending = [f for f in pdb_files if f.name not in done]
+    if done:
+        print(f"Resuming: {total - len(pending)} / {total} already scored")
+    print(f"Scoring {len(pending)} structures:")
+    # Rewritten through a temporary file so that a crash here cannot lose the
+    # scores of the interrupted run
+    tmp_path = partial_path.with_name(partial_path.name + ".tmp")
+    tmp_path.write_text(
+        "".join(json.dumps(x) + "\n" for x in [settings, *done.values()])
+    )
+    os.replace(tmp_path, partial_path)
+    with open(partial_path, "a") as partial_file:
+        for i, pdb_file in enumerate(pending, start=1):
+            pdb_scores = {"structure": pdb_file.name, **scorer.score_pdb(pdb_file)}
+            done[pdb_file.name] = pdb_scores
+            partial_file.write(json.dumps(pdb_scores) + "\n")
+            partial_file.flush()
+            print(f"  > Run {i} / {len(pending)}: {pdb_scores}")
 
-    headers = scores[0].keys()
+    scores = [done[f.name] for f in pdb_files]
+
+    # Per-chain columns depend on each structure's chains: write the union of all
+    # columns, leaving the ones a structure does not have empty
+    headers = list(dict.fromkeys(key for pdb_scores in scores for key in pdb_scores))
     with open(csv_output_path, "w", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=headers)
+        writer = csv.DictWriter(csv_file, fieldnames=headers, restval="")
         writer.writeheader()
         writer.writerows(scores)
+    partial_path.unlink()
