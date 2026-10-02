@@ -35,7 +35,7 @@ Options:
 
 - `--contact-guidance-scale`: strength. `0` (default) turns guidance off; `1.0` is recommended.
 - `--contact-guidance-mode`:
-  - `gradient` (default): backpropagates the contact penalty through the diffusion module and steps the noisy coordinates. Lets the network reconcile the contact with the fold, but needs much more GPU memory (a backward pass per sample; it did not fit a 414-token complex on a 22 GB GPU) and more time.
+  - `gradient` (default): backpropagates the contact penalty through the diffusion module and steps the noisy coordinates. Lets the network reconcile the contact with the fold, but needs more GPU memory and time (a backward pass per sample; a 414-token complex peaked at about 9 GB).
   - `rigid`: moves each chain as a rigid body (translation plus rotation) towards its violated contacts. No gradients and almost free, but it can cause severe clashes between chains.
 - `--contact-guidance-sigma-min` / `--contact-guidance-sigma-max`: noise levels between which guidance is active (defaults 1 and 160). Higher maximum values can cause clashes, especially in `rigid` mode.
 - `--contact-guidance-max-step`: largest per-atom step per call in `gradient` mode, in Å (default 10).

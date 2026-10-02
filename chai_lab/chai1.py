@@ -955,6 +955,10 @@ def run_folding_on_context(
         with _component_moved_to(
             "diffusion_module.pt", device=device
         ) as diffusion_module:
+            if guided_by_gradient:
+                # only d loss / d coords is needed; frozen weights save less memory
+                for param in diffusion_module.jit_module.parameters():
+                    param.requires_grad_(False)
             for sigma_curr, sigma_next, gamma_curr in tqdm(
                 sigmas_and_gammas, desc="Diffusion steps"
             ):
