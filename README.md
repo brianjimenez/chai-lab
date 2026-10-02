@@ -31,6 +31,8 @@ chai-lab fold input.fasta output_folder
 
 By default, the model generates five sample predictions, and uses embeddings without MSAs or templates. For additional information about how to supply MSAs, templates, and restraints to the model, see the documentation below, or run `chai-lab fold --help`.
 
+Runs are reproducible: the same input with the same `--seed` gives the same structures, also across GPUs of the same type and across processes. This turns on PyTorch's deterministic mode, which costs about 3% runtime and 1 GB of peak GPU memory in our tests; pass `--no-deterministic` to turn it off (for example when GPU memory is tight), in which case repeated runs with the same seed can differ by several Å. Structures are only reproducible with a fixed `--seed`, and not when an MSA or templates server is used (its results can change between runs).
+
 For example, to run the model with MSAs (which we recommend for improved performance), pass the `--use-msa-server` and `--use-templates-server` flags:
 
 ```shell
