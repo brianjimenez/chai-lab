@@ -98,6 +98,7 @@ from chai_lab.data.features.generators.token_pair_pocket_restraint import (
 from chai_lab.data.io.cif_utils import get_chain_letter, save_to_cif
 from chai_lab.data.parsing.restraints import parse_pairwise_table
 from chai_lab.data.parsing.structure.entity_type import EntityType
+from chai_lab.model.contact_guidance import ContactGuidance, ContactGuidanceConfig
 from chai_lab.model.diffusion_schedules import InferenceNoiseSchedule
 from chai_lab.model.utils import center_random_augmentation
 from chai_lab.ranking.frames import get_frames_and_mask
@@ -110,6 +111,10 @@ from chai_lab.utils.typing import Float, typecheck
 
 class UnsupportedInputError(RuntimeError):
     pass
+
+
+# samples per backward pass in gradient-guided diffusion (memory)
+_GRAD_CHUNK = 1
 
 
 class ModuleWrapper:
@@ -517,16 +522,37 @@ def run_inference(
     seed: int | None = None,
     device: str | None = None,
     low_memory: bool = True,
+    # Guide diffusion towards satisfying contact restraints (0 = off, needs constraint_path)
+    contact_guidance_scale: float = 0.0,
+    contact_guidance_sigma_min: float = 1.0,
+    contact_guidance_sigma_max: float = 160.0,
+    # gradient: step on the contact-penalty gradient through the diffusion module;
+    # rigid: move whole chains (cheaper, but can cause clashes)
+    contact_guidance_mode: str = "gradient",
+    contact_guidance_max_step: float = 10.0,
+    # False: constraints only guide the diffusion, the trunk does not see them
+    restraints_to_trunk: bool = True,
     # IO options
     fasta_names_as_cif_chains: bool = False,
 ) -> StructureCandidates:
     """Runs inference on sequences in the provided fasta file.
+
+    Contact guidance (off unless contact_guidance_scale > 0, which needs
+    constraint_path) corrects the coordinates during diffusion so that the contact
+    restraints hold. Mode "gradient" (recommended, scale 1) backpropagates the contact
+    penalty through the diffusion module, which needs much more GPU memory; "rigid"
+    moves whole chains and can cause clashes.
 
     Important notes:
     - If fasta_names_as_cif_chains is True, fasta entity names are used for parsing
       and writing chains. Restraints must ALSO be named w.r.t. fasta names.
     """
     assert num_trunk_samples > 0 and num_diffn_samples > 0
+    if contact_guidance_scale > 0:
+        assert (
+            constraint_path is not None
+        ), "contact_guidance_scale > 0 requires constraint_path"
+        assert contact_guidance_mode in ("gradient", "rigid"), contact_guidance_mode
     if output_dir.exists():
         assert not any(
             output_dir.iterdir()
@@ -549,6 +575,24 @@ def run_inference(
         esm_device=torch_device,
     )
 
+    if not restraints_to_trunk:
+        feature_context.restraint_context = RestraintContext.empty()
+
+    guidance = None
+    if contact_guidance_scale > 0:
+        assert constraint_path is not None
+        guidance = ContactGuidance.from_interactions(
+            parse_pairwise_table(constraint_path),
+            feature_context.structure_context,
+            ContactGuidanceConfig(
+                scale=contact_guidance_scale,
+                sigma_min=contact_guidance_sigma_min,
+                sigma_max=contact_guidance_sigma_max,
+                mode=contact_guidance_mode,
+                max_step=contact_guidance_max_step,
+            ),
+        )
+
     all_candidates: list[StructureCandidates] = []
     for trunk_idx in range(num_trunk_samples):
         logging.info(f"Trunk sample {trunk_idx + 1}/{num_trunk_samples}")
@@ -567,6 +611,7 @@ def run_inference(
             device=torch_device,
             low_memory=low_memory,
             entity_names_as_chain_names_in_output_cif=fasta_names_as_cif_chains,
+            contact_guidance=guidance,
         )
         all_candidates.append(cand)
     return StructureCandidates.concat(all_candidates)
@@ -592,6 +637,7 @@ def run_folding_on_context(
     device: torch.device | None = None,
     low_memory: bool,
     atom_coords: Tensor | None = None,
+    contact_guidance: ContactGuidance | None = None,
 ) -> StructureCandidates:
     """
     Function for in-depth explorations.
@@ -833,6 +879,56 @@ def run_folding_on_context(
                 **static_diffusion_inputs,
             )
 
+        guided_by_gradient = (
+            contact_guidance is not None and contact_guidance.config.mode == "gradient"
+        )
+        if contact_guidance is not None:
+            contact_guidance.to(device)
+            atom_group = (
+                inputs["token_asym_id"]
+                .long()
+                .to(device)
+                .gather(1, atom_token_indices.to(device))
+            )
+        if contact_guidance is not None and not guided_by_gradient:
+            _unguided_denoise = _denoise
+
+            def _denoise(
+                diff_mod: ModuleWrapper, atom_pos: Tensor, sigma: Tensor, ds: int
+            ) -> Tensor:
+                out = _unguided_denoise(diff_mod, atom_pos, sigma, ds)
+                return contact_guidance.apply(
+                    out,
+                    sigma,
+                    atom_group=atom_group,
+                    atom_mask=atom_single_mask,
+                )
+
+        def _first_denoise(
+            diff_mod: ModuleWrapper, atom_pos: Tensor, sigma: Tensor, ds: int
+        ) -> tuple[Tensor, Tensor | None]:
+            """Denoise; in gradient mode also the guidance step for the new coords."""
+            if not guided_by_gradient:
+                return _denoise(diff_mod, atom_pos, sigma, ds), None
+            assert contact_guidance is not None
+            if contact_guidance.config.weight(float(sigma)) == 0.0:
+                return _denoise(diff_mod, atom_pos, sigma, ds), None
+            # backprop through the diffusion module, a few samples at a time
+            denoised, steps = [], []
+            for i in range(0, ds, _GRAD_CHUNK):
+                x = atom_pos[i : i + _GRAD_CHUNK].detach().clone().requires_grad_(True)
+                with torch.enable_grad():
+                    out = _denoise(diff_mod, x, sigma, x.shape[0])
+                    loss = contact_guidance.loss(out)
+                    (grad,) = torch.autograd.grad(loss.sum(), x)
+                denoised.append(out.detach())
+                steps.append(
+                    contact_guidance.gradient_step(
+                        grad, loss.detach(), float(sigma), atom_single_mask
+                    )
+                )
+            return torch.cat(denoised), torch.cat(steps)
+
         inference_noise_schedule = InferenceNoiseSchedule(
             s_max=DiffusionConfig.S_tmax,
             s_min=4e-4,
@@ -859,6 +955,10 @@ def run_folding_on_context(
         with _component_moved_to(
             "diffusion_module.pt", device=device
         ) as diffusion_module:
+            if guided_by_gradient:
+                # only d loss / d coords is needed; frozen weights save less memory
+                for param in diffusion_module.jit_module.parameters():
+                    param.requires_grad_(False)
             for sigma_curr, sigma_next, gamma_curr in tqdm(
                 sigmas_and_gammas, desc="Diffusion steps"
             ):
@@ -881,7 +981,7 @@ def run_folding_on_context(
                 atom_pos_hat = atom_pos + noise * atom_pos_noise
 
                 # Lines 7-8
-                denoised_pos = _denoise(
+                denoised_pos, guide_step = _first_denoise(
                     diff_mod=diffusion_module,
                     atom_pos=atom_pos_hat,
                     sigma=sigma_hat,
@@ -904,6 +1004,16 @@ def run_folding_on_context(
                     atom_pos = atom_pos + (sigma_next - sigma_hat) * (
                         (d_i_prime + d_i) / 2
                     )
+                if guide_step is not None:
+                    atom_pos = atom_pos + guide_step
+
+        if contact_guidance is not None:
+            for i, v in enumerate(contact_guidance.violations(atom_pos).cpu()):
+                logging.info(
+                    f"Contact guidance, sample {i}: "
+                    f"{int((v.abs() > 0).sum())}/{v.numel()} contacts violated, "
+                    f"max excess {v.abs().max():.2f} A"
+                )
 
         del static_diffusion_inputs
         torch.cuda.empty_cache()

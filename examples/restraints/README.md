@@ -23,6 +23,28 @@ A few other notes:
 - The `comment` field is not read as an input and is included for user convenience.
 - The `confidence` and `min_distance_angstrom` fields are _currently_ not used by the model, and are included in this format for future-proofing.
 
+## Contact guidance during diffusion
+
+By default, `contact` restraints only enter the model as an input feature of the trunk, so the predicted structure can still violate them. Contact guidance additionally corrects the coordinates at every diffusion step so that the contacts hold. It is off by default and requires `--constraint-path`:
+
+```bash
+chai-lab fold input.fasta out/ --constraint-path contact.restraints --contact-guidance-scale 1.0
+```
+
+Options:
+
+- `--contact-guidance-scale`: strength. `0` (default) turns guidance off; `1.0` is recommended.
+- `--contact-guidance-mode`:
+  - `gradient` (default): backpropagates the contact penalty through the diffusion module and steps the noisy coordinates. Lets the network reconcile the contact with the fold, but needs more GPU memory and time (a backward pass per sample; a 414-token complex peaked at about 9 GB).
+  - `rigid`: moves each chain as a rigid body (translation plus rotation) towards its violated contacts. No gradients and almost free, but it can cause severe clashes between chains.
+- `--contact-guidance-sigma-min` / `--contact-guidance-sigma-max`: noise levels between which guidance is active (defaults 1 and 160). Higher maximum values can cause clashes, especially in `rigid` mode.
+- `--contact-guidance-max-step`: largest per-atom step per call in `gradient` mode, in Å (default 10).
+- `--no-restraints-to-trunk`: keeps the contacts from the trunk, so that only guidance enforces them.
+
+A residue-level contact is measured between the closest heavy atoms of the two residues; give an atom (e.g. `A12@CB`) to use that atom instead. Same-chain contacts and `pocket` restraints are ignored by guidance. The number of violated contacts per sample is logged after diffusion.
+
+Guidance is most useful when the trunk cannot use the contacts (`--no-restraints-to-trunk`); when the trunk already receives them, guidance mainly removes the contact violations it leaves. The default settings are starting points.
+
 ## Example
 
 As an example, consider the PDB structure [7SYZ](https://www.rcsb.org/structure/7SYZ). Without restraints provided, Chai-1 does not accurately predict the interface between the viral protein domain and the heavy/light chains (see below table for interface DockQ scores). We provide $n=2$ randomly selected contact restraints based on the experimental ground truth structure, and see that doing so significantly improves the interface DockQ scores between the viral protein and the antibody chains. Providing $n=2$ pocket restraints has a similarly positive effect, though the effect is smaller due to the lower specificity of pocket restraints (see below table).
