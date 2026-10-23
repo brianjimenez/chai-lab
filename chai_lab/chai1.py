@@ -103,6 +103,7 @@ from chai_lab.model.diffusion_schedules import InferenceNoiseSchedule
 from chai_lab.model.utils import center_random_augmentation
 from chai_lab.ranking.frames import get_frames_and_mask
 from chai_lab.ranking.rank import SampleRanking, get_scores, rank
+from chai_lab.utils.determinism import make_deterministic
 from chai_lab.utils.paths import chai1_component
 from chai_lab.utils.plot import plot_msa
 from chai_lab.utils.tensor_utils import move_data_to_device, set_seed, und_self
@@ -522,6 +523,9 @@ def run_inference(
     seed: int | None = None,
     device: str | None = None,
     low_memory: bool = True,
+    # Same seed, same structures (see make_deterministic). Costs about 3% time and 1 GB
+    # of peak GPU memory in our tests; turn off if memory is tight.
+    deterministic: bool = True,
     # Guide diffusion towards satisfying contact restraints (0 = off, needs constraint_path)
     contact_guidance_scale: float = 0.0,
     contact_guidance_sigma_min: float = 1.0,
@@ -548,6 +552,8 @@ def run_inference(
       and writing chains. Restraints must ALSO be named w.r.t. fasta names.
     """
     assert num_trunk_samples > 0 and num_diffn_samples > 0
+    if deterministic:
+        make_deterministic()
     if contact_guidance_scale > 0:
         assert (
             constraint_path is not None

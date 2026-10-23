@@ -14,7 +14,7 @@ class FakeScorer:
     scored: list[str] = []
     fail_on: str | None = None
 
-    def __init__(self, msa_directory=None, num_trunk_recycles=3):
+    def __init__(self, msa_directory=None, num_trunk_recycles=6):
         pass
 
     def score_pdb(self, pdb_file_path):

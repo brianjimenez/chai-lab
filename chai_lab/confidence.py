@@ -15,6 +15,8 @@ import torch
 from Bio.PDB import PDBParser
 from Bio.PDB.Residue import Residue
 
+from chai_lab.utils.determinism import make_deterministic
+
 # Import chai_lab core modules
 try:
     from chai_lab.chai1 import make_all_atom_feature_context, run_folding_on_context
@@ -51,30 +53,6 @@ THREE_TO_ONE = {
     "TRP": "W",
     "TYR": "Y",
 }
-
-
-def make_deterministic():
-    """
-    Makes scores reproducible on GPU. Otherwise the same structure can score
-    differently from run to run (seen: aggregate score from 0.43 to 0.59), from
-    two sources that seeding does not control:
-    - non-deterministic CUDA kernels;
-    - the TorchScript executor of Chai's exported components, which switches to
-      fused kernels after the first calls, so the first structure scored in a
-      process gets different numbers than the next ones.
-    Affects the whole process; call it before any CUDA work.
-    """
-    # Needed by deterministic cuBLAS; only read when cuBLAS is initialized
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch._C._jit_set_profiling_executor(False)
-    torch._C._jit_set_profiling_mode(False)
-    torch._C._jit_override_can_fuse_on_gpu(False)
-    torch._C._jit_set_texpr_fuser_enabled(False)
 
 
 def keep_models_resident():
@@ -135,7 +113,7 @@ class ChaiConfidenceScorer:
         self,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         msa_directory: Path | None = None,
-        num_trunk_recycles: int = 3,
+        num_trunk_recycles: int = 6,
     ):
         self.device = device
         if num_trunk_recycles < 1:
@@ -348,6 +326,49 @@ class ChaiConfidenceScorer:
         return fasta_str
 
     @staticmethod
+    def _read_fasta(fasta_path: Path) -> tuple[list[tuple[str, list]], str]:
+        """
+        Reads a protein FASTA file. Returns the chains as (id, []) pairs (there are
+        no PDB residues) and the FASTA content in Chai's format. The chain id is
+        the `name=` of a Chai-style header (`>protein|name=X`) or else the first
+        word of the header.
+        """
+        records: list[tuple[str, str]] = []
+        for line in fasta_path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                records.append((line[1:].strip(), ""))
+            elif records:
+                header, seq = records[-1]
+                records[-1] = (header, seq + line)
+            else:
+                raise ValueError(f"{fasta_path.name}: sequence before first header.")
+        if not records:
+            raise ValueError(f"No sequences found in {fasta_path.name}.")
+
+        chains: list[tuple[str, list]] = []
+        fasta_content = ""
+        for header, seq in records:
+            kind, sep, rest = header.partition("|")
+            if sep and kind.strip().lower() != "protein":
+                raise ValueError(
+                    f"{fasta_path.name}: only protein chains are supported, "
+                    f"got '{kind}'."
+                )
+            name = rest if sep else header
+            if name.startswith("name="):
+                name = name[len("name=") :]
+            chain_id = name.split()[0] if name.split() else f"{len(chains) + 1}"
+            seq = seq.upper()
+            if not seq:
+                raise ValueError(f"{fasta_path.name}: empty sequence for '{header}'.")
+            chains.append((chain_id, []))
+            fasta_content += f">protein|name={chain_id}\n{seq}\n"
+        return chains, fasta_content
+
+    @staticmethod
     def _map_atom_coords(
         structure_context: AllAtomStructureContext,
         chains: list[tuple[str, list[Residue]]],
@@ -445,8 +466,30 @@ class ChaiConfidenceScorer:
         chains = self._extract_chains(pdb_file_path)
         if not chains:
             raise ValueError("No standard amino acid residues found in PDB.")
-        fasta_content = self._to_fasta(chains)
+        return self._score(chains, self._to_fasta(chains), path, use_pdb_coords=True)
 
+    def score_fasta(self, fasta_file_path: str) -> dict:
+        """
+        Scores the sequences of a FASTA file without any structure: the trunk runs
+        on sequence (and MSA) and the confidence head gets all atoms at the origin,
+        so the coordinates add the same constant to every input and the scores
+        read out the trunk alone. No diffusion runs.
+        """
+        path = Path(fasta_file_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"FASTA file not found: {fasta_file_path}")
+
+        print(f"Parsing {path.name}...")
+        chains, fasta_content = self._read_fasta(path)
+        return self._score(chains, fasta_content, path, use_pdb_coords=False)
+
+    def _score(
+        self,
+        chains: list[tuple[str, list[Residue]]],
+        fasta_content: str,
+        path: Path,
+        use_pdb_coords: bool,
+    ) -> dict:
         device = torch.device(self.device)
         with tempfile.TemporaryDirectory() as tmpdir:
             base_path = Path(tmpdir)
@@ -475,17 +518,22 @@ class ChaiConfidenceScorer:
                 chai_seqs == parsed_seqs
             ), f"Sequence mismatch: {chai_seqs} != {parsed_seqs}"
 
-            atom_coords, num_rebuilt = self._map_atom_coords(
-                feature_context.structure_context, chains
-            )
-            if num_rebuilt > 0:
-                print(
-                    f">> Warning: rebuilt {num_rebuilt} heavy atoms missing in {path.name}."
+            atom_coords, num_rebuilt = None, 0
+            if not use_pdb_coords:
+                atom_coords = torch.zeros(feature_context.structure_context.num_atoms, 3)
+            if use_pdb_coords:
+                atom_coords, num_rebuilt = self._map_atom_coords(
+                    feature_context.structure_context, chains
                 )
-
-            print(
-                "Running Chai-1 trunk and scoring the PDB coordinates (skipping diffusion)..."
-            )
+                if num_rebuilt > 0:
+                    print(
+                        f">> Warning: rebuilt {num_rebuilt} heavy atoms missing in {path.name}."
+                    )
+                print(
+                    "Running Chai-1 trunk and scoring the PDB coordinates (skipping diffusion)..."
+                )
+            else:
+                print("Running Chai-1 trunk and scoring without structure (no diffusion)...")
             candidates = run_folding_on_context(
                 feature_context,
                 output_dir=base_path / "chai_outputs",
@@ -503,8 +551,17 @@ class ChaiConfidenceScorer:
         scores = self._flatten_scores(
             get_scores(candidates.ranking_data[0]), chain_labels
         )
+        if not use_pdb_coords:
+            # Meaningless without coordinates: the clash penalty saturates
+            scores = {
+                k: v
+                for k, v in scores.items()
+                if k not in ("aggregate_score", "has_inter_chain_clashes")
+                and not k.startswith("clashes_")
+            }
 
-        scores["rebuilt_atoms"] = num_rebuilt
+        if use_pdb_coords:
+            scores["rebuilt_atoms"] = num_rebuilt
         if self.msa_directory is not None:
             scores["msa_chains"] = f"{found}/{len(chains)}"
             scores["msa_trimmed"] = ";".join(trimmed)
@@ -545,26 +602,29 @@ def _load_partial_scores(partial_path: Path, settings: dict) -> dict[str, dict]:
 
 
 def score(
-    pdb_files: list[Path],
+    input_files: list[Path],
     csv_output_path: Path,
     msa_directory: Path | None = None,
-    num_trunk_recycles: int = 3,
+    num_trunk_recycles: int = 6,
     deterministic: bool = True,
     keep_models_on_gpu: bool = True,
     resume: bool = True,
 ):
     """
-    Scores a list of PDB structures through the confidence head and
-    write the result in a CSV output file.
+    Scores a list of FASTA files (protein chains) and writes the result in a CSV
+    output file. No structure is needed and none is predicted: the confidence head
+    runs on the trunk output of the sequences (and MSAs) with uninformative
+    coordinates, giving ptm, iptm and their per-chain versions (no clash or
+    aggregate scores). PDB files (.pdb) are also accepted: their coordinates are
+    scored directly.
 
     If msa_directory is given, precomputed MSAs (.aligned.pqt files named by
     sequence hash, e.g. from `chai-lab a3m-to-pqt`) found in it or any of its
-    subfolders are used by the trunk. The subfolder named after a PDB file (e.g.
-    <msa_directory>/complex_1/ for complex_1.pdb) is searched first.
+    subfolders are used by the trunk. The subfolder named after an input file (e.g.
+    <msa_directory>/complex_1/ for complex_1.fasta) is searched first.
     A chain without an exact match uses an MSA whose query contains its
     sequence, trimmed of the extra terminal residues (msa_trimmed column).
-    num_trunk_recycles defaults to 3, as in `chai-lab fold`, so that scores
-    are comparable to regular Chai-1 predictions.
+    num_trunk_recycles defaults to 6 (`chai-lab fold` uses 3).
     With deterministic (default), a structure always gets the same scores (see
     make_deterministic); --no-deterministic may be faster on some GPUs.
     With keep_models_on_gpu (default), the models stay on the GPU between
@@ -598,8 +658,8 @@ def score(
     if msa_directory is not None:
         print(f"Using MSAs from {msa_directory}")
     print("Done.")
-    total = len(pdb_files)
-    pending = [f for f in pdb_files if f.name not in done]
+    total = len(input_files)
+    pending = [f for f in input_files if f.name not in done]
     if done:
         print(f"Resuming: {total - len(pending)} / {total} already scored")
     print(f"Scoring {len(pending)} structures:")
@@ -611,14 +671,18 @@ def score(
     )
     os.replace(tmp_path, partial_path)
     with open(partial_path, "a") as partial_file:
-        for i, pdb_file in enumerate(pending, start=1):
-            pdb_scores = {"structure": pdb_file.name, **scorer.score_pdb(pdb_file)}
-            done[pdb_file.name] = pdb_scores
+        for i, input_file in enumerate(pending, start=1):
+            if input_file.suffix.lower() == ".pdb":
+                file_scores = scorer.score_pdb(input_file)
+            else:
+                file_scores = scorer.score_fasta(input_file)
+            pdb_scores = {"structure": input_file.name, **file_scores}
+            done[input_file.name] = pdb_scores
             partial_file.write(json.dumps(pdb_scores) + "\n")
             partial_file.flush()
             print(f"  > Run {i} / {len(pending)}: {pdb_scores}")
 
-    scores = [done[f.name] for f in pdb_files]
+    scores = [done[f.name] for f in input_files]
 
     # Per-chain columns depend on each structure's chains: write the union of all
     # columns, leaving the ones a structure does not have empty
