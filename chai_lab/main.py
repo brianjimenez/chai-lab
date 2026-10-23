@@ -37,7 +37,7 @@ def citation():
 def cli():
     app = typer.Typer()
     app.command("fold", help="Run Chai-1 to fold a complex.")(run_inference)
-    app.command("score", help="Run Chai-1 confidence header to score a list of PDB structures.")(score)
+    app.command("score", help="Score FASTA files (sequence and MSA only, no structure) with the Chai-1 confidence head.")(score)
     app.command(
         "a3m-to-pqt",
         help="Convert all a3m files in a directory for a *single sequence* into a aligned parquet file.",

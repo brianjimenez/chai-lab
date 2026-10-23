@@ -47,6 +47,24 @@ chai-lab fold --use-msa-server --msa-server-url "https://api.internalcolabserver
 
 We also provide additional utility functions for tasks such as MSA file format conversion; see `chai --help` for details.
 
+### Scoring sequences without a structure
+
+`chai-lab score` rates protein complexes from their sequences (and optionally MSAs) alone. It needs a FASTA file per complex, no PDB structure, and it runs no diffusion:
+
+```shell
+chai-lab score complex_1.fasta complex_2.fasta scores.csv
+```
+
+The trunk runs on the sequences and the confidence head gets all atoms at the origin, so the scores read out the trunk only. Each FASTA file is one complex, with one entry per protein chain (`>protein|name=A` or a plain `>A` header; other entity types are not supported). The CSV has one row per file with `ptm`, `iptm`, per-chain `ptm_<X>` and pairwise `iptm_<X>_<Y>`. Clash and aggregate scores are not reported, since they are meaningless without coordinates.
+
+Options:
+
+- `--msa-directory DIR`: use precomputed `.aligned.pqt` MSAs (see `chai-lab a3m-to-pqt`) found in `DIR` or its subfolders. The subfolder named after the input file (`DIR/complex_1/` for `complex_1.fasta`) is searched first, so name the FASTA files after the MSA folders; otherwise the MSA is looked up by sequence hash across all folders, which may pick a different copy for complexes sharing a chain.
+- `--num-trunk-recycles N`: defaults to 6 (`fold` uses 3).
+- `--no-deterministic`, `--no-keep-models-on-gpu`, `--no-resume`: see `chai-lab score --help`. Scores are saved to `<output>.partial.jsonl` as they are computed, so an interrupted run resumes where it stopped.
+
+A `.pdb` input is still accepted and is scored with its own coordinates.
+
 ### Pythonic inference
 
 The main entrypoint into the Chai-1 folding code is through the `chai_lab.chai1.run_inference` function. The following script demonstrates how to provide inputs to the model, and obtain a list of PDB files for downstream analysis:
